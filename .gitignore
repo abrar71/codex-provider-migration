@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Common Codex state and migration backups must never be published here.
+.codex/
+codex-provider-backup*/
+migration-manifest.json
+config.toml
+auth.json
+history.jsonl
+state_*.sqlite
+state_*.sqlite-*
+thread_history_*.sqlite*
+sessions/
+archived_sessions/
+logs/
+*.log

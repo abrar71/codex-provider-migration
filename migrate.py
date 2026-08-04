@@ -1,0 +1,2060 @@
+#!/usr/bin/env python3
+"""Back up, migrate, and verify legacy Codex model-provider metadata.
+
+The command does not change Codex records unless --apply is supplied. A
+read-only SQLite open may create standard WAL coordination sidecars. The tool
+intentionally refuses compressed or paginated rollouts because changing JSONL
+byte lengths could invalidate history offsets in those formats.
+"""
+
+from __future__ import annotations
+
+import argparse
+import collections
+import copy
+import dataclasses
+import datetime as dt
+import hashlib
+import json
+import os
+import re
+import shutil
+import sqlite3
+import stat
+import sys
+import tempfile
+import tomllib
+from pathlib import Path
+from typing import Any
+
+
+TOOL_VERSION = "1.0.0"
+MANIFEST_VERSION = 2
+MANIFEST_NAME = "migration-manifest.json"
+STATE_DB_NAME = "state_5.sqlite"
+SESSION_DIR_NAMES = ("sessions", "archived_sessions")
+PROVIDER_KEYS = ("model_provider", "model_provider_id")
+KNOWN_PROVIDER_PATHS = {
+    ("payload", "model_provider"),
+    ("payload", "thread_settings", "model_provider_id"),
+}
+PERSISTENT_SQLITE_PRAGMAS = (
+    "application_id",
+    "auto_vacuum",
+    "default_cache_size",
+    "encoding",
+    "page_size",
+    "schema_version",
+    "user_version",
+)
+
+
+class MigrationError(RuntimeError):
+    """Raised when a safety precondition or verification check fails."""
+
+
+@dataclasses.dataclass(frozen=True)
+class RolloutAnalysis:
+    rollout_files: int
+    rollout_heads_from_provider: int
+    files_requiring_changes: int
+    session_meta_values: int
+    thread_settings_values: int
+    malformed_lines: int
+    valid_lines: int
+    total_lines: int
+    file_hashes: dict[str, str]
+    file_metadata: dict[str, dict[str, int]]
+
+    @property
+    def replacements(self) -> int:
+        return self.session_meta_values + self.thread_settings_values
+
+
+@dataclasses.dataclass(frozen=True)
+class DatabaseAnalysis:
+    rows_from_provider: int
+    integrity_check: str
+    tables: int
+    persistent_settings: dict[str, int | str]
+
+
+@dataclasses.dataclass(frozen=True)
+class VerificationReport:
+    rollout_files_checked: int
+    changed_rollout_files: int
+    unchanged_rollout_files: int
+    jsonl_lines_checked: int
+    malformed_lines_preserved: int
+    session_meta_values_changed: int
+    thread_settings_values_changed: int
+    sqlite_tables_checked: int
+    sqlite_rows_checked: int
+    sqlite_thread_rows_changed: int
+    config_matches_expected: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class RestorationReport:
+    rollout_files_restored: int
+    config_restored: bool
+    sqlite_tables_checked: int
+    sqlite_rows_checked: int
+
+
+def sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def capture_file_metadata(path: Path) -> dict[str, int]:
+    metadata = path.stat()
+    return {
+        "mode": stat.S_IMODE(metadata.st_mode),
+        "uid": metadata.st_uid,
+        "gid": metadata.st_gid,
+        "mtime_ns": metadata.st_mtime_ns,
+    }
+
+
+def apply_file_metadata(path: Path, metadata: dict[str, int]) -> None:
+    set_file_owner(path, metadata["uid"], metadata["gid"])
+    # chown can clear setuid/setgid bits, even when the requested owner is
+    # unchanged. Apply the recorded mode only after ownership is settled.
+    os.chmod(path, metadata["mode"])
+    current = path.stat()
+    os.utime(path, ns=(current.st_atime_ns, metadata["mtime_ns"]))
+
+
+def artifact_descriptor(
+    content_path: Path,
+    metadata: dict[str, int],
+) -> dict[str, Any]:
+    return {
+        "present": True,
+        "sha256": sha256_file(content_path),
+        **metadata,
+    }
+
+
+def json_string_bytes(value: str) -> bytes:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def provider_pattern(key: str, provider: str) -> re.Pattern[bytes]:
+    return re.compile(
+        rb'("'
+        + re.escape(key.encode("utf-8"))
+        + rb'"\s*:\s*)'
+        + re.escape(json_string_bytes(provider))
+    )
+
+
+def replacement_patterns(
+    source_provider: str, target_provider: str
+) -> list[tuple[re.Pattern[bytes], bytes]]:
+    target = json_string_bytes(target_provider)
+    return [
+        (provider_pattern(key, source_provider), target) for key in PROVIDER_KEYS
+    ]
+
+
+def replace_provider_bytes(
+    value: bytes, source_provider: str, target_provider: str
+) -> tuple[bytes, int]:
+    updated = value
+    replacements = 0
+    for pattern, target in replacement_patterns(source_provider, target_provider):
+        updated, count = pattern.subn(lambda match: match.group(1) + target, updated)
+        replacements += count
+    return updated, replacements
+
+
+def session_roots(codex_home: Path) -> list[Path]:
+    roots: list[Path] = []
+    for name in SESSION_DIR_NAMES:
+        root = codex_home / name
+        if root.is_symlink():
+            raise MigrationError(f"refusing symlinked session root: {root}")
+        if root.is_dir():
+            roots.append(root)
+    return roots
+
+
+def rollout_paths(codex_home: Path) -> list[Path]:
+    paths: list[Path] = []
+    for root in session_roots(codex_home):
+        for path in root.rglob("*.jsonl"):
+            if path.is_symlink():
+                raise MigrationError(f"refusing symlinked rollout: {path}")
+            if path.is_file():
+                paths.append(path)
+    return sorted(paths)
+
+
+def relative_rollout_path(codex_home: Path, path: Path) -> str:
+    return path.relative_to(codex_home).as_posix()
+
+
+def count_raw_provider_matches(line: bytes, source_provider: str) -> int:
+    return sum(
+        len(provider_pattern(key, source_provider).findall(line))
+        for key in PROVIDER_KEYS
+    )
+
+
+def walk_provider_values(
+    value: Any,
+    source_provider: str,
+    path: tuple[str, ...] = (),
+) -> list[tuple[str, ...]]:
+    unknown: list[tuple[str, ...]] = []
+    if isinstance(value, dict):
+        for key, child in value.items():
+            child_path = (*path, str(key))
+            if (
+                key in PROVIDER_KEYS
+                and child == source_provider
+                and child_path not in KNOWN_PROVIDER_PATHS
+            ):
+                unknown.append(child_path)
+            unknown.extend(walk_provider_values(child, source_provider, child_path))
+    elif isinstance(value, list):
+        for child in value:
+            unknown.extend(walk_provider_values(child, source_provider, path))
+    return unknown
+
+
+def structural_provider_changes(record: Any, source_provider: str) -> tuple[int, int]:
+    if not isinstance(record, dict):
+        return 0, 0
+    payload = record.get("payload")
+    if not isinstance(payload, dict):
+        return 0, 0
+
+    session_meta = int(
+        record.get("type") == "session_meta"
+        and payload.get("model_provider") == source_provider
+    )
+    settings = payload.get("thread_settings")
+    thread_settings = int(
+        record.get("type") == "event_msg"
+        and payload.get("type") == "thread_settings_applied"
+        and isinstance(settings, dict)
+        and settings.get("model_provider_id") == source_provider
+    )
+    return session_meta, thread_settings
+
+
+def assert_legacy_rollout(record: Any, path: Path, line_number: int) -> None:
+    if not isinstance(record, dict) or record.get("type") != "session_meta":
+        return
+    payload = record.get("payload")
+    if not isinstance(payload, dict):
+        return
+    if (
+        payload.get("history_mode") == "paginated"
+        or payload.get("history_base") is not None
+    ):
+        raise MigrationError(
+            f"refusing paginated/history_base rollout at {path}:{line_number}"
+        )
+
+
+def analyze_rollouts(codex_home: Path, source_provider: str) -> RolloutAnalysis:
+    files = rollout_paths(codex_home)
+    file_hashes: dict[str, str] = {}
+    file_metadata: dict[str, dict[str, int]] = {}
+    heads = 0
+    files_requiring_changes = 0
+    session_meta_values = 0
+    thread_settings_values = 0
+    malformed_lines = 0
+    valid_lines = 0
+    total_lines = 0
+
+    for path in files:
+        data = path.read_bytes()
+        relative = relative_rollout_path(codex_home, path)
+        file_hashes[relative] = sha256_bytes(data)
+        file_metadata[relative] = capture_file_metadata(path)
+        file_replacements = 0
+        first_session_meta_seen = False
+
+        for line_number, line in enumerate(data.splitlines(keepends=True), 1):
+            total_lines += 1
+            if not line.strip():
+                continue
+            raw_matches = count_raw_provider_matches(line, source_provider)
+            try:
+                record = json.loads(line)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                malformed_lines += 1
+                if raw_matches:
+                    raise MigrationError(
+                        "refusing provider text inside an unparseable JSONL line at "
+                        f"{path}:{line_number}"
+                    )
+                continue
+
+            valid_lines += 1
+            assert_legacy_rollout(record, path, line_number)
+            unknown_paths = walk_provider_values(record, source_provider)
+            if unknown_paths:
+                rendered = ", ".join(".".join(item) for item in unknown_paths)
+                raise MigrationError(
+                    "refusing unknown provider metadata path at "
+                    f"{path}:{line_number}: {rendered}"
+                )
+
+            meta_count, settings_count = structural_provider_changes(
+                record, source_provider
+            )
+            structural_count = meta_count + settings_count
+            if raw_matches != structural_count:
+                raise MigrationError(
+                    "provider byte matches do not map one-to-one to known metadata at "
+                    f"{path}:{line_number} "
+                    f"(raw={raw_matches}, structural={structural_count})"
+                )
+
+            if isinstance(record, dict) and record.get("type") == "session_meta":
+                payload = record.get("payload")
+                if not first_session_meta_seen and isinstance(payload, dict):
+                    first_session_meta_seen = True
+                    if payload.get("model_provider") == source_provider:
+                        heads += 1
+
+            session_meta_values += meta_count
+            thread_settings_values += settings_count
+            file_replacements += structural_count
+
+        if file_replacements:
+            files_requiring_changes += 1
+
+    return RolloutAnalysis(
+        rollout_files=len(files),
+        rollout_heads_from_provider=heads,
+        files_requiring_changes=files_requiring_changes,
+        session_meta_values=session_meta_values,
+        thread_settings_values=thread_settings_values,
+        malformed_lines=malformed_lines,
+        valid_lines=valid_lines,
+        total_lines=total_lines,
+        file_hashes=file_hashes,
+        file_metadata=file_metadata,
+    )
+
+
+def ensure_supported_storage(codex_home: Path, sqlite_home: Path) -> None:
+    compressed: list[Path] = []
+    for root in session_roots(codex_home):
+        for path in root.rglob("*"):
+            if path.is_symlink():
+                raise MigrationError(f"refusing symlink inside session tree: {path}")
+        compressed.extend(root.rglob("*.zst"))
+        compressed.extend(root.rglob("*.gz"))
+    if compressed:
+        raise MigrationError(f"refusing compressed rollout: {sorted(compressed)[0]}")
+    history_db = sqlite_home / "thread_history_1.sqlite"
+    if history_db.exists():
+        raise MigrationError(
+            f"refusing paginated thread-history database: {history_db}"
+        )
+
+
+def validate_state_db_path(path: Path) -> None:
+    if path.is_symlink():
+        raise MigrationError(f"refusing symlinked state database: {path}")
+    if not path.is_file():
+        raise MigrationError(f"state database not found: {path}")
+
+
+def sqlite_read_only_uri(path: Path, *, immutable: bool = False) -> str:
+    query = "?mode=ro"
+    if immutable:
+        query += "&immutable=1"
+    return path.resolve().as_uri() + query
+
+
+def sqlite_header_journal_mode(path: Path) -> str:
+    with path.open("rb") as stream:
+        header = stream.read(100)
+    if len(header) != 100 or header[:16] != b"SQLite format 3\x00":
+        raise MigrationError(f"invalid SQLite file header: {path}")
+    read_version, write_version = header[18], header[19]
+    if (read_version, write_version) == (2, 2):
+        return "wal"
+    if (read_version, write_version) == (1, 1):
+        return "delete"
+    raise MigrationError(f"unsupported SQLite file format versions: {path}")
+
+
+def read_persistent_sqlite_settings(
+    connection: sqlite3.Connection,
+) -> dict[str, int | str]:
+    settings: dict[str, int | str] = {}
+    for pragma in PERSISTENT_SQLITE_PRAGMAS:
+        rows = connection.execute(f"PRAGMA {pragma}").fetchall()
+        if len(rows) != 1 or len(rows[0]) != 1 or not isinstance(
+            rows[0][0], (int, str)
+        ):
+            raise MigrationError(f"cannot read SQLite persistent setting: {pragma}")
+        settings[pragma] = rows[0][0]
+    return settings
+
+
+def normalize_database_backup_settings(
+    database_path: Path,
+    expected: dict[str, int | str],
+) -> None:
+    if set(expected) != {*PERSISTENT_SQLITE_PRAGMAS, "journal_mode"}:
+        raise MigrationError("invalid SQLite persistent-settings preflight")
+    connection = sqlite3.connect(database_path)
+    try:
+        journal_mode = expected["journal_mode"]
+        if journal_mode not in {"delete", "persist", "truncate", "wal"}:
+            raise MigrationError(
+                f"unsupported persistent SQLite journal mode: {journal_mode}"
+            )
+        actual_mode = connection.execute(
+            f"PRAGMA journal_mode = {journal_mode}"
+        ).fetchone()[0]
+        if actual_mode != journal_mode:
+            raise MigrationError("could not preserve SQLite journal_mode in backup")
+
+        current = read_persistent_sqlite_settings(connection)
+        for pragma in (
+            "application_id",
+            "default_cache_size",
+            "schema_version",
+            "user_version",
+        ):
+            value = expected[pragma]
+            if type(value) is not int:
+                raise MigrationError(
+                    f"invalid integer SQLite persistent setting: {pragma}"
+                )
+            if current[pragma] != value:
+                connection.execute(f"PRAGMA {pragma} = {value}")
+
+        actual = read_persistent_sqlite_settings(connection)
+        actual["journal_mode"] = connection.execute(
+            "PRAGMA journal_mode"
+        ).fetchone()[0]
+        if actual != expected:
+            differing = sorted(
+                name for name in expected if actual.get(name) != expected[name]
+            )
+            raise MigrationError(
+                "SQLite backup changed persistent settings: " + ", ".join(differing)
+            )
+    finally:
+        connection.close()
+
+
+def analyze_database(db_path: Path, source_provider: str) -> DatabaseAnalysis:
+    validate_state_db_path(db_path)
+    connection = sqlite3.connect(sqlite_read_only_uri(db_path), uri=True)
+    try:
+        connection.execute("BEGIN")
+        integrity_rows = connection.execute("PRAGMA integrity_check").fetchall()
+        if integrity_rows != [("ok",)]:
+            raise MigrationError(f"SQLite integrity_check failed: {integrity_rows!r}")
+        foreign_key_rows = connection.execute("PRAGMA foreign_key_check").fetchall()
+        if foreign_key_rows:
+            raise MigrationError(
+                f"SQLite foreign_key_check failed: {foreign_key_rows!r}"
+            )
+        columns = {
+            row[1] for row in connection.execute('PRAGMA table_info("threads")')
+        }
+        if "model_provider" not in columns:
+            raise MigrationError("threads.model_provider is absent from state database")
+        rows = connection.execute(
+            "SELECT count(*) FROM threads WHERE model_provider = ?",
+            (source_provider,),
+        ).fetchone()[0]
+        tables = connection.execute(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table'"
+        ).fetchone()[0]
+        persistent_settings = read_persistent_sqlite_settings(connection)
+        persistent_settings["journal_mode"] = sqlite_header_journal_mode(db_path)
+    finally:
+        connection.close()
+    return DatabaseAnalysis(
+        rows_from_provider=int(rows),
+        integrity_check="ok",
+        tables=int(tables),
+        persistent_settings=persistent_settings,
+    )
+
+
+def require_writable_database(db_path: Path) -> None:
+    validate_state_db_path(db_path)
+    connection = sqlite3.connect(db_path.resolve().as_uri() + "?mode=rw", uri=True)
+    try:
+        connection.execute("PRAGMA busy_timeout = 5000")
+        connection.execute("BEGIN IMMEDIATE")
+        user_version = connection.execute("PRAGMA user_version").fetchone()[0]
+        connection.execute(f"PRAGMA user_version = {int(user_version)}")
+        connection.rollback()
+    except sqlite3.Error as exc:
+        raise MigrationError(f"state database is not writable: {db_path}") from exc
+    finally:
+        connection.close()
+
+
+def transform_config(
+    raw: bytes, source_provider: str, target_provider: str
+) -> bytes:
+    if target_provider != "openai":
+        raise MigrationError(
+            "automatic config migration only supports target provider 'openai'"
+        )
+    try:
+        text = raw.decode("utf-8")
+        parsed = tomllib.loads(text)
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        raise MigrationError(f"cannot parse config.toml: {exc}") from exc
+
+    if parsed.get("model_provider") != source_provider:
+        raise MigrationError(
+            f"config.toml does not select model_provider={source_provider!r}"
+        )
+    providers = parsed.get("model_providers")
+    if not isinstance(providers, dict) or not isinstance(
+        providers.get(source_provider), dict
+    ):
+        raise MigrationError(
+            f"config.toml has no [model_providers.{source_provider}] table"
+        )
+    provider = providers[source_provider]
+    allowed_keys = {"base_url", "name", "requires_openai_auth", "wire_api"}
+    unsupported_keys = sorted(set(provider) - allowed_keys)
+    if unsupported_keys:
+        raise MigrationError(
+            "automatic config migration cannot preserve provider keys: "
+            + ", ".join(unsupported_keys)
+        )
+    base_url = provider.get("base_url")
+    if not isinstance(base_url, str) or not base_url:
+        raise MigrationError("custom provider base_url is missing or empty")
+    if provider.get("requires_openai_auth") is not True:
+        raise MigrationError(
+            "custom provider requires_openai_auth must be true to match built-in openai"
+        )
+    if provider.get("wire_api") not in (None, "responses"):
+        raise MigrationError("custom provider wire_api must be 'responses'")
+    existing_base_url = parsed.get("openai_base_url")
+    if existing_base_url is not None and existing_base_url != base_url:
+        raise MigrationError(
+            "existing openai_base_url conflicts with provider base_url"
+        )
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", source_provider):
+        raise MigrationError(
+            "automatic config migration requires a bare TOML provider id"
+        )
+
+    lines = text.splitlines(keepends=True)
+    first_table = next(
+        (index for index, line in enumerate(lines) if line.lstrip().startswith("[")),
+        len(lines),
+    )
+    selector_re = re.compile(r"^\s*model_provider\s*=.*(?:\r?\n)?$")
+    selector_indices = [
+        index
+        for index, line in enumerate(lines[:first_table])
+        if selector_re.match(line)
+    ]
+    if len(selector_indices) != 1:
+        raise MigrationError("could not uniquely locate root model_provider assignment")
+
+    table_re = re.compile(
+        rf"^\s*\[model_providers\.{re.escape(source_provider)}\]\s*(?:\r?\n)?$"
+    )
+    table_indices = [index for index, line in enumerate(lines) if table_re.match(line)]
+    if len(table_indices) != 1:
+        raise MigrationError("could not uniquely locate custom provider table")
+    table_start = table_indices[0]
+    table_end = next(
+        (
+            index
+            for index in range(table_start + 1, len(lines))
+            if lines[index].lstrip().startswith("[")
+        ),
+        len(lines),
+    )
+
+    remove_indices = set(range(table_start, table_end))
+    remove_indices.add(selector_indices[0])
+    retained = [line for index, line in enumerate(lines) if index not in remove_indices]
+    if existing_base_url is None:
+        newline = "\r\n" if "\r\n" in text else "\n"
+        retained.insert(
+            0,
+            f"openai_base_url = {json.dumps(base_url, ensure_ascii=False)}{newline}",
+        )
+    updated = "".join(retained).encode("utf-8")
+
+    expected = copy.deepcopy(parsed)
+    expected["openai_base_url"] = base_url
+    del expected["model_provider"]
+    del expected["model_providers"][source_provider]
+    if not expected["model_providers"]:
+        del expected["model_providers"]
+    try:
+        reparsed = tomllib.loads(updated.decode("utf-8"))
+    except tomllib.TOMLDecodeError as exc:
+        raise MigrationError(f"generated config.toml is invalid: {exc}") from exc
+    if reparsed != expected:
+        raise MigrationError(
+            "generated config.toml changes values outside migration scope"
+        )
+    return updated
+
+
+def set_file_owner(path: Path, uid: int, gid: int) -> None:
+    chown = getattr(os, "chown", None)
+    if chown is None:
+        return
+    try:
+        chown(path, uid, gid)
+    except PermissionError:
+        if (path.stat().st_uid, path.stat().st_gid) != (uid, gid):
+            raise
+
+
+def atomic_write(
+    path: Path,
+    value: bytes,
+    *,
+    preserve_mtime: bool,
+) -> None:
+    metadata = path.stat()
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.provider-migration-", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(value)
+            stream.flush()
+            os.fsync(stream.fileno())
+        set_file_owner(temporary, metadata.st_uid, metadata.st_gid)
+        os.chmod(temporary, stat.S_IMODE(metadata.st_mode))
+        if preserve_mtime:
+            os.utime(
+                temporary,
+                ns=(metadata.st_atime_ns, metadata.st_mtime_ns),
+            )
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def find_processes_with_open_state(codex_home: Path, sqlite_home: Path) -> list[int]:
+    proc = Path("/proc")
+    if not proc.is_dir():
+        return []
+    watched_roots = [
+        *(root.resolve() for root in session_roots(codex_home)),
+        sqlite_home.resolve(),
+    ]
+    current_pid = os.getpid()
+    matches: list[int] = []
+    for entry in proc.iterdir():
+        if not entry.name.isdigit() or int(entry.name) == current_pid:
+            continue
+        looks_like_codex = False
+        try:
+            command_args = [
+                value.decode("utf-8", errors="replace")
+                for value in (entry / "cmdline").read_bytes().split(b"\0")
+                if value
+            ]
+            looks_like_codex = any(
+                Path(argument).name.lower() in {"codex", "codex.exe", "codex.js"}
+                or "/@openai/codex/" in argument.replace("\\", "/").lower()
+                for argument in command_args
+            )
+        except (FileNotFoundError, PermissionError, OSError):
+            pass
+        fd_root = entry / "fd"
+        try:
+            descriptors = list(fd_root.iterdir())
+        except (FileNotFoundError, PermissionError):
+            if looks_like_codex:
+                matches.append(int(entry.name))
+            continue
+        found = False
+        for descriptor in descriptors:
+            try:
+                target = descriptor.resolve(strict=True)
+            except (FileNotFoundError, PermissionError, OSError):
+                continue
+            for root in watched_roots:
+                try:
+                    target.relative_to(root)
+                except ValueError:
+                    continue
+                found = True
+                break
+            if found:
+                break
+        if found or looks_like_codex:
+            matches.append(int(entry.name))
+    return sorted(matches)
+
+
+def copy_database_backup(
+    source: Path,
+    destination: Path,
+    *,
+    source_immutable: bool = False,
+) -> None:
+    source_connection = sqlite3.connect(
+        sqlite_read_only_uri(source, immutable=source_immutable),
+        uri=True,
+    )
+    destination_connection = sqlite3.connect(destination)
+    try:
+        source_connection.backup(destination_connection)
+    finally:
+        destination_connection.close()
+        source_connection.close()
+
+
+def write_json_atomic(path: Path, value: dict[str, Any]) -> None:
+    encoded = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    if path.exists():
+        atomic_write(path, encoded, preserve_mtime=False)
+        return
+    path.write_bytes(encoded)
+    os.chmod(path, 0o600)
+
+
+def create_backup(
+    *,
+    codex_home: Path,
+    sqlite_home: Path,
+    db_path: Path,
+    backup_dir: Path,
+    source_provider: str,
+    target_provider: str,
+    rollout_analysis: RolloutAnalysis,
+    database_analysis: DatabaseAnalysis,
+    migrate_config: bool,
+) -> dict[str, Any]:
+    if backup_dir.exists():
+        raise MigrationError(f"backup directory already exists: {backup_dir}")
+    backup_dir.mkdir(parents=True, mode=0o700)
+
+    config_path = codex_home / "config.toml"
+    if config_path.is_symlink():
+        raise MigrationError(f"refusing symlinked config: {config_path}")
+    config_artifact: dict[str, Any] = {"present": False}
+    if config_path.is_file():
+        config_metadata = capture_file_metadata(config_path)
+        config_backup = backup_dir / "config.toml"
+        shutil.copy2(config_path, config_backup)
+        apply_file_metadata(config_backup, config_metadata)
+        config_artifact = artifact_descriptor(config_backup, config_metadata)
+    elif config_path.exists():
+        raise MigrationError(f"config path is not a regular file: {config_path}")
+    for name in SESSION_DIR_NAMES:
+        source = codex_home / name
+        if source.is_dir():
+            shutil.copytree(
+                source,
+                backup_dir / name,
+                copy_function=shutil.copy2,
+                symlinks=True,
+            )
+    database_metadata = capture_file_metadata(db_path)
+    database_backup = backup_dir / db_path.name
+    copy_database_backup(db_path, database_backup)
+    normalize_database_backup_settings(
+        database_backup, database_analysis.persistent_settings
+    )
+    apply_file_metadata(database_backup, database_metadata)
+    database_artifact = artifact_descriptor(database_backup, database_metadata)
+
+    for relative, expected_hash in rollout_analysis.file_hashes.items():
+        copied = backup_dir / relative
+        expected_metadata = rollout_analysis.file_metadata[relative]
+        if copied.is_file():
+            apply_file_metadata(copied, expected_metadata)
+        if not copied.is_file() or sha256_file(copied) != expected_hash:
+            raise MigrationError(f"backup hash mismatch for {relative}")
+        if capture_file_metadata(copied) != expected_metadata:
+            raise MigrationError(f"backup metadata mismatch for {relative}")
+
+    manifest: dict[str, Any] = {
+        "manifest_version": MANIFEST_VERSION,
+        "tool_version": TOOL_VERSION,
+        "status": "prepared",
+        "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "codex_home": str(codex_home),
+        "sqlite_home": str(sqlite_home),
+        "state_db_name": db_path.name,
+        "source_provider": source_provider,
+        "target_provider": target_provider,
+        "migrate_config": migrate_config,
+        "rollout_analysis": dataclasses.asdict(rollout_analysis),
+        "database_analysis": dataclasses.asdict(database_analysis),
+        "artifacts": {
+            "config": config_artifact,
+            "database": database_artifact,
+        },
+    }
+    write_json_atomic(backup_dir / MANIFEST_NAME, manifest)
+    return manifest
+
+
+def compare_sqlite_databases(
+    original_path: Path,
+    migrated_path: Path,
+    source_provider: str,
+    target_provider: str,
+    *,
+    allow_restore_intermediate: bool = False,
+) -> tuple[int, int, int]:
+    original = sqlite3.connect(
+        sqlite_read_only_uri(original_path, immutable=True),
+        uri=True,
+    )
+    migrated = sqlite3.connect(sqlite_read_only_uri(migrated_path), uri=True)
+    tables_checked = 0
+    rows_checked = 0
+    changed_rows = 0
+    try:
+        original.execute("BEGIN")
+        migrated.execute("BEGIN")
+        if original.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
+            raise MigrationError("backup SQLite integrity_check failed")
+        if migrated.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
+            raise MigrationError("migrated SQLite integrity_check failed")
+        if original.execute("PRAGMA foreign_key_check").fetchall():
+            raise MigrationError("backup SQLite foreign_key_check failed")
+        if migrated.execute("PRAGMA foreign_key_check").fetchall():
+            raise MigrationError("migrated SQLite foreign_key_check failed")
+
+        original_settings = read_persistent_sqlite_settings(original)
+        migrated_settings = read_persistent_sqlite_settings(migrated)
+        for pragma in PERSISTENT_SQLITE_PRAGMAS:
+            if original_settings[pragma] == migrated_settings[pragma]:
+                continue
+            if (
+                allow_restore_intermediate
+                and pragma == "schema_version"
+                and type(original_settings[pragma]) is int
+                and migrated_settings[pragma] == original_settings[pragma] + 1
+            ):
+                continue
+            raise MigrationError(f"SQLite persistent setting changed: {pragma}")
+        if sqlite_header_journal_mode(
+            original_path
+        ) != sqlite_header_journal_mode(migrated_path):
+            raise MigrationError("SQLite persistent setting changed: journal_mode")
+
+        schema_query = (
+            "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name"
+        )
+        if original.execute(schema_query).fetchall() != migrated.execute(
+            schema_query
+        ).fetchall():
+            raise MigrationError("SQLite schema changed")
+        tables = [
+            row[0]
+            for row in original.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+            )
+        ]
+        migrated_tables = [
+            row[0]
+            for row in migrated.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+            )
+        ]
+        if tables != migrated_tables:
+            raise MigrationError("SQLite table set changed")
+
+        for table in tables:
+            quoted = '"' + table.replace('"', '""') + '"'
+            columns = [
+                row[1]
+                for row in original.execute(f"PRAGMA table_info({quoted})")
+            ]
+            original_rows = original.execute(f"SELECT * FROM {quoted}").fetchall()
+            migrated_rows = migrated.execute(f"SELECT * FROM {quoted}").fetchall()
+            expected_rows = original_rows
+            if table == "threads":
+                provider_index = columns.index("model_provider")
+                expected_rows = []
+                for row in original_rows:
+                    expected = list(row)
+                    if expected[provider_index] == source_provider:
+                        expected[provider_index] = target_provider
+                        changed_rows += 1
+                    expected_rows.append(tuple(expected))
+            if collections.Counter(expected_rows) != collections.Counter(migrated_rows):
+                raise MigrationError(f"unexpected SQLite change in table {table}")
+            tables_checked += 1
+            rows_checked += len(original_rows)
+    finally:
+        original.close()
+        migrated.close()
+    return tables_checked, rows_checked, changed_rows
+
+
+def load_backup_manifest(backup_dir: Path) -> dict[str, Any]:
+    manifest_path = backup_dir / MANIFEST_NAME
+    try:
+        manifest = json.loads(manifest_path.read_bytes().decode("utf-8"))
+    except (FileNotFoundError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise MigrationError(f"cannot read backup manifest: {exc}") from exc
+    if not isinstance(manifest, dict):
+        raise MigrationError("invalid backup manifest: root must be an object")
+    required_string_fields = {
+        "codex_home",
+        "sqlite_home",
+        "state_db_name",
+        "source_provider",
+        "target_provider",
+    }
+    missing = sorted(required_string_fields - manifest.keys())
+    if missing:
+        raise MigrationError(
+            "invalid backup manifest: missing " + ", ".join(missing)
+        )
+    invalid_strings = sorted(
+        name
+        for name in required_string_fields
+        if not isinstance(manifest[name], str)
+        or not manifest[name].strip()
+        or "\x00" in manifest[name]
+    )
+    if invalid_strings:
+        raise MigrationError(
+            "invalid backup manifest fields: " + ", ".join(invalid_strings)
+        )
+    if manifest.get("manifest_version") != MANIFEST_VERSION:
+        raise MigrationError("unsupported backup manifest version")
+    if not isinstance(manifest.get("migrate_config"), bool):
+        raise MigrationError("invalid backup manifest field: migrate_config")
+    if manifest["state_db_name"] != STATE_DB_NAME:
+        raise MigrationError("invalid backup manifest state database name")
+    invalid_paths = sorted(
+        name
+        for name in ("codex_home", "sqlite_home")
+        if not Path(manifest[name]).is_absolute()
+    )
+    if invalid_paths:
+        raise MigrationError(
+            "backup manifest paths must be absolute: " + ", ".join(invalid_paths)
+        )
+    return manifest
+
+
+def validate_recorded_metadata(value: Any, label: str) -> dict[str, int]:
+    if not isinstance(value, dict):
+        raise MigrationError(f"invalid backup manifest metadata: {label}")
+    expected_keys = {"mode", "uid", "gid", "mtime_ns"}
+    if set(value) != expected_keys or any(
+        type(value[name]) is not int for name in expected_keys
+    ):
+        raise MigrationError(f"invalid backup manifest metadata: {label}")
+    if (
+        value["mode"] < 0
+        or value["mode"] > 0o7777
+        or value["uid"] < 0
+        or value["gid"] < 0
+        or value["mtime_ns"] < 0
+    ):
+        raise MigrationError(f"invalid backup manifest metadata: {label}")
+    return value
+
+
+def validate_sha256(value: Any, label: str) -> str:
+    if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise MigrationError(f"invalid backup manifest digest: {label}")
+    return value
+
+
+def validate_backup_artifacts(
+    backup_dir: Path,
+    manifest: dict[str, Any],
+) -> None:
+    rollout_analysis = manifest.get("rollout_analysis")
+    if not isinstance(rollout_analysis, dict):
+        raise MigrationError("invalid backup manifest rollout analysis")
+    expected_hashes = rollout_analysis.get("file_hashes")
+    expected_metadata = rollout_analysis.get("file_metadata")
+    if not isinstance(expected_hashes, dict) or not isinstance(
+        expected_metadata, dict
+    ):
+        raise MigrationError("invalid backup manifest rollout artifacts")
+
+    backup_rollouts = {
+        relative_rollout_path(backup_dir, path): path
+        for path in rollout_paths(backup_dir)
+    }
+    if set(expected_hashes) != set(backup_rollouts) or set(expected_metadata) != set(
+        backup_rollouts
+    ):
+        raise MigrationError("backup rollout file set differs from the manifest")
+    for relative, path in backup_rollouts.items():
+        expected_hash = validate_sha256(
+            expected_hashes[relative], f"rollout {relative}"
+        )
+        metadata = validate_recorded_metadata(
+            expected_metadata[relative], f"rollout {relative}"
+        )
+        if sha256_file(path) != expected_hash:
+            raise MigrationError(f"backup rollout digest mismatch: {relative}")
+        if capture_file_metadata(path) != metadata:
+            raise MigrationError(f"backup rollout metadata mismatch: {relative}")
+
+    artifacts = manifest.get("artifacts")
+    if not isinstance(artifacts, dict) or set(artifacts) != {"config", "database"}:
+        raise MigrationError("invalid backup manifest artifacts")
+
+    config_descriptor = artifacts["config"]
+    if not isinstance(config_descriptor, dict) or type(
+        config_descriptor.get("present")
+    ) is not bool:
+        raise MigrationError("invalid backup manifest config artifact")
+    config_path = backup_dir / "config.toml"
+    if config_descriptor["present"]:
+        if config_path.is_symlink() or not config_path.is_file():
+            raise MigrationError("backup config.toml is missing or unsafe")
+        config_metadata = validate_recorded_metadata(
+            {
+                key: config_descriptor.get(key)
+                for key in ("mode", "uid", "gid", "mtime_ns")
+            },
+            "config.toml",
+        )
+        config_hash = validate_sha256(
+            config_descriptor.get("sha256"), "config.toml"
+        )
+        if sha256_file(config_path) != config_hash:
+            raise MigrationError("backup config.toml digest mismatch")
+        if capture_file_metadata(config_path) != config_metadata:
+            raise MigrationError("backup config.toml metadata mismatch")
+    elif config_path.exists() or config_path.is_symlink():
+        raise MigrationError("unexpected config.toml exists in backup")
+
+    database_descriptor = artifacts["database"]
+    if not isinstance(database_descriptor, dict) or database_descriptor.get(
+        "present"
+    ) is not True:
+        raise MigrationError("invalid backup manifest database artifact")
+    database_path = backup_dir / manifest["state_db_name"]
+    if database_path.is_symlink() or not database_path.is_file():
+        raise MigrationError("backup state database is missing or unsafe")
+    database_metadata = validate_recorded_metadata(
+        {
+            key: database_descriptor.get(key)
+            for key in ("mode", "uid", "gid", "mtime_ns")
+        },
+        manifest["state_db_name"],
+    )
+    database_hash = validate_sha256(
+        database_descriptor.get("sha256"), manifest["state_db_name"]
+    )
+    if sha256_file(database_path) != database_hash:
+        raise MigrationError("backup state database digest mismatch")
+    if capture_file_metadata(database_path) != database_metadata:
+        raise MigrationError("backup state database metadata mismatch")
+    for suffix in ("-wal", "-shm", "-journal"):
+        if Path(f"{database_path}{suffix}").exists():
+            raise MigrationError(f"unexpected SQLite sidecar in backup: {suffix}")
+
+
+def verify_against_backup(
+    *,
+    backup_dir: Path,
+    codex_home: Path | None = None,
+    sqlite_home: Path | None = None,
+) -> VerificationReport:
+    manifest = load_backup_manifest(backup_dir)
+    validate_backup_artifacts(backup_dir, manifest)
+    source_provider = manifest["source_provider"]
+    target_provider = manifest["target_provider"]
+    codex_home = (codex_home or Path(manifest["codex_home"])).resolve()
+    sqlite_home = (sqlite_home or Path(manifest["sqlite_home"])).resolve()
+    db_name = manifest["state_db_name"]
+
+    original_paths = rollout_paths(backup_dir)
+    migrated_paths = rollout_paths(codex_home)
+    original_by_relative = {
+        relative_rollout_path(backup_dir, path): path for path in original_paths
+    }
+    migrated_by_relative = {
+        relative_rollout_path(codex_home, path): path for path in migrated_paths
+    }
+    if original_by_relative.keys() != migrated_by_relative.keys():
+        missing = sorted(original_by_relative.keys() - migrated_by_relative.keys())
+        extra = sorted(migrated_by_relative.keys() - original_by_relative.keys())
+        raise MigrationError(
+            f"rollout file set changed; missing={missing}, extra={extra}"
+        )
+
+    backup_analysis = analyze_rollouts(backup_dir, source_provider)
+    changed_files = 0
+    unchanged_files = 0
+    malformed_preserved = 0
+    lines_checked = 0
+    session_meta_changed = 0
+    thread_settings_changed = 0
+
+    for relative in sorted(original_by_relative):
+        original_path = original_by_relative[relative]
+        migrated_path = migrated_by_relative[relative]
+        original = original_path.read_bytes()
+        migrated = migrated_path.read_bytes()
+        expected, replacements = replace_provider_bytes(
+            original, source_provider, target_provider
+        )
+        if migrated != expected:
+            raise MigrationError(f"unexpected rollout byte change: {relative}")
+        if replacements:
+            changed_files += 1
+        else:
+            unchanged_files += 1
+
+        original_stat = original_path.stat()
+        migrated_stat = migrated_path.stat()
+        if stat.S_IMODE(original_stat.st_mode) != stat.S_IMODE(migrated_stat.st_mode):
+            raise MigrationError(f"rollout mode changed: {relative}")
+        if (original_stat.st_uid, original_stat.st_gid) != (
+            migrated_stat.st_uid,
+            migrated_stat.st_gid,
+        ):
+            raise MigrationError(f"rollout ownership changed: {relative}")
+        if original_stat.st_mtime_ns != migrated_stat.st_mtime_ns:
+            raise MigrationError(f"rollout mtime changed: {relative}")
+
+        original_lines = original.splitlines(keepends=True)
+        migrated_lines = migrated.splitlines(keepends=True)
+        if len(original_lines) != len(migrated_lines):
+            raise MigrationError(f"rollout line count changed: {relative}")
+        for line_number, (before, after) in enumerate(
+            zip(original_lines, migrated_lines), 1
+        ):
+            lines_checked += 1
+            if not before.strip():
+                if before != after:
+                    raise MigrationError(
+                        f"blank line changed: {relative}:{line_number}"
+                    )
+                continue
+            try:
+                before_record = json.loads(before)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                if before != after:
+                    raise MigrationError(
+                        f"malformed line changed: {relative}:{line_number}"
+                    )
+                malformed_preserved += 1
+                continue
+            try:
+                after_record = json.loads(after)
+            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                raise MigrationError(
+                    f"valid line became invalid: {relative}:{line_number}"
+                ) from exc
+            expected_record = copy.deepcopy(before_record)
+            payload = (
+                expected_record.get("payload")
+                if isinstance(expected_record, dict)
+                else None
+            )
+            if isinstance(payload, dict):
+                if (
+                    expected_record.get("type") == "session_meta"
+                    and payload.get("model_provider") == source_provider
+                ):
+                    payload["model_provider"] = target_provider
+                    session_meta_changed += 1
+                settings = payload.get("thread_settings")
+                if (
+                    expected_record.get("type") == "event_msg"
+                    and payload.get("type") == "thread_settings_applied"
+                    and isinstance(settings, dict)
+                    and settings.get("model_provider_id") == source_provider
+                ):
+                    settings["model_provider_id"] = target_provider
+                    thread_settings_changed += 1
+            if after_record != expected_record:
+                raise MigrationError(
+                    f"unexpected logical rollout change: {relative}:{line_number}"
+                )
+
+    current_analysis = analyze_rollouts(codex_home, source_provider)
+    if current_analysis.replacements:
+        raise MigrationError("source-provider rollout metadata remains after migration")
+    if session_meta_changed != backup_analysis.session_meta_values:
+        raise MigrationError(
+            "session_meta replacement count changed during verification"
+        )
+    if thread_settings_changed != backup_analysis.thread_settings_values:
+        raise MigrationError(
+            "thread_settings replacement count changed during verification"
+        )
+
+    config_backup = backup_dir / "config.toml"
+    config_current = codex_home / "config.toml"
+    config_descriptor = manifest["artifacts"]["config"]
+    config_matches_expected = not config_descriptor["present"]
+    if config_descriptor["present"]:
+        expected_config = config_backup.read_bytes()
+        if manifest.get("migrate_config"):
+            expected_config = transform_config(
+                expected_config, source_provider, target_provider
+            )
+        config_matches_expected = (
+            not config_current.is_symlink()
+            and config_current.is_file()
+            and config_current.read_bytes() == expected_config
+        )
+        if not config_matches_expected:
+            raise MigrationError("config.toml differs from the expected migration")
+        backup_stat = config_backup.stat()
+        current_stat = config_current.stat()
+        if stat.S_IMODE(backup_stat.st_mode) != stat.S_IMODE(current_stat.st_mode):
+            raise MigrationError("config.toml mode changed during migration")
+        if (backup_stat.st_uid, backup_stat.st_gid) != (
+            current_stat.st_uid,
+            current_stat.st_gid,
+        ):
+            raise MigrationError("config.toml ownership changed during migration")
+        if (
+            not manifest["migrate_config"]
+            and backup_stat.st_mtime_ns != current_stat.st_mtime_ns
+        ):
+            raise MigrationError("config.toml mtime changed during migration")
+    elif config_current.exists() or config_current.is_symlink():
+        raise MigrationError("config.toml appeared after the backup was created")
+
+    validate_state_db_path(sqlite_home / db_name)
+    tables, rows, changed_rows = compare_sqlite_databases(
+        backup_dir / db_name,
+        sqlite_home / db_name,
+        source_provider,
+        target_provider,
+    )
+    database_metadata = manifest["artifacts"]["database"]
+    current_database_metadata = capture_file_metadata(sqlite_home / db_name)
+    for key in ("mode", "uid", "gid"):
+        if current_database_metadata[key] != database_metadata[key]:
+            raise MigrationError(f"SQLite {key} changed during migration")
+    return VerificationReport(
+        rollout_files_checked=len(original_by_relative),
+        changed_rollout_files=changed_files,
+        unchanged_rollout_files=unchanged_files,
+        jsonl_lines_checked=lines_checked,
+        malformed_lines_preserved=malformed_preserved,
+        session_meta_values_changed=session_meta_changed,
+        thread_settings_values_changed=thread_settings_changed,
+        sqlite_tables_checked=tables,
+        sqlite_rows_checked=rows,
+        sqlite_thread_rows_changed=changed_rows,
+        config_matches_expected=config_matches_expected,
+    )
+
+
+def verify_recoverable_state(
+    *,
+    backup_dir: Path,
+    codex_home: Path,
+    sqlite_home: Path,
+    manifest: dict[str, Any],
+) -> None:
+    """Require every live artifact to be exactly original or exactly migrated.
+
+    File replacement and the SQLite provider update are individually atomic,
+    but a process interruption can leave different artifacts on different
+    sides of the migration. Accepting only these two known states makes a
+    restore resumable without overwriting later Codex activity.
+    """
+
+    validate_backup_artifacts(backup_dir, manifest)
+    source_provider = manifest["source_provider"]
+    target_provider = manifest["target_provider"]
+
+    backup_paths = {
+        relative_rollout_path(backup_dir, path): path
+        for path in rollout_paths(backup_dir)
+    }
+    live_paths = {
+        relative_rollout_path(codex_home, path): path
+        for path in rollout_paths(codex_home)
+    }
+    if backup_paths.keys() != live_paths.keys():
+        raise MigrationError(
+            "live rollout file set is not recoverable from this backup"
+        )
+    for relative, backup_path in backup_paths.items():
+        original = backup_path.read_bytes()
+        migrated, _ = replace_provider_bytes(
+            original, source_provider, target_provider
+        )
+        live_path = live_paths[relative]
+        if live_path.read_bytes() not in (original, migrated):
+            raise MigrationError(
+                f"live rollout is neither original nor migrated: {relative}"
+            )
+        expected_metadata = manifest["rollout_analysis"]["file_metadata"][relative]
+        if capture_file_metadata(live_path) != expected_metadata:
+            raise MigrationError(
+                f"live rollout metadata is not recoverable: {relative}"
+            )
+
+    config_descriptor = manifest["artifacts"]["config"]
+    config_backup = backup_dir / "config.toml"
+    config_current = codex_home / "config.toml"
+    if not config_descriptor["present"]:
+        if config_current.exists() or config_current.is_symlink():
+            raise MigrationError(
+                "live config.toml is not recoverable because it was absent "
+                "from the backup"
+            )
+    else:
+        if config_current.is_symlink() or not config_current.is_file():
+            raise MigrationError("live config.toml is missing or unsafe")
+        original_config = config_backup.read_bytes()
+        migrated_config = original_config
+        if manifest["migrate_config"]:
+            migrated_config = transform_config(
+                original_config, source_provider, target_provider
+            )
+        current_config = config_current.read_bytes()
+        if current_config not in (original_config, migrated_config):
+            raise MigrationError(
+                "live config.toml is neither original nor migrated"
+            )
+        expected_metadata = validate_recorded_metadata(
+            {
+                key: config_descriptor[key]
+                for key in ("mode", "uid", "gid", "mtime_ns")
+            },
+            "config.toml",
+        )
+        current_metadata = capture_file_metadata(config_current)
+        for key in ("mode", "uid", "gid"):
+            if current_metadata[key] != expected_metadata[key]:
+                raise MigrationError(
+                    f"live config.toml {key} is neither original nor migrated"
+                )
+        if (
+            current_config == original_config
+            and current_metadata["mtime_ns"] != expected_metadata["mtime_ns"]
+        ):
+            raise MigrationError(
+                "live config.toml mtime is not the original recorded value"
+            )
+
+    database_path = sqlite_home / manifest["state_db_name"]
+    validate_state_db_path(database_path)
+    expected_database_metadata = manifest["artifacts"]["database"]
+    current_database_metadata = capture_file_metadata(database_path)
+    for key in ("uid", "gid"):
+        if current_database_metadata[key] != expected_database_metadata[key]:
+            raise MigrationError(
+                f"live SQLite {key} is neither original nor migrated"
+            )
+    expected_mode = expected_database_metadata["mode"]
+    known_modes = {expected_mode, expected_mode & ~(stat.S_ISUID | stat.S_ISGID)}
+    if current_database_metadata["mode"] not in known_modes:
+        raise MigrationError("live SQLite mode is neither original nor migrated")
+    try:
+        compare_sqlite_databases(
+            backup_dir / manifest["state_db_name"],
+            database_path,
+            source_provider,
+            target_provider,
+        )
+    except (MigrationError, sqlite3.Error):
+        try:
+            compare_sqlite_databases(
+                backup_dir / manifest["state_db_name"],
+                database_path,
+                source_provider,
+                source_provider,
+                allow_restore_intermediate=True,
+            )
+        except (MigrationError, sqlite3.Error) as original_error:
+            raise MigrationError(
+                "live SQLite state is neither original nor migrated"
+            ) from original_error
+
+
+def restore_file_from_backup(source: Path, destination: Path) -> None:
+    if source.is_symlink() or not source.is_file():
+        raise MigrationError(f"backup file is missing or unsafe: {source}")
+    if destination.is_symlink():
+        raise MigrationError(f"refusing symlinked restore destination: {destination}")
+    if destination.exists() and not destination.is_file():
+        raise MigrationError(f"restore destination is not a file: {destination}")
+    if not destination.parent.is_dir() or destination.parent.is_symlink():
+        raise MigrationError(
+            f"restore destination directory is missing or unsafe: {destination.parent}"
+        )
+
+    source_metadata = source.stat()
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.provider-restore-",
+        dir=destination.parent,
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(source.read_bytes())
+            stream.flush()
+            os.fsync(stream.fileno())
+        set_file_owner(temporary, source_metadata.st_uid, source_metadata.st_gid)
+        os.chmod(temporary, stat.S_IMODE(source_metadata.st_mode))
+        os.utime(
+            temporary,
+            ns=(source_metadata.st_atime_ns, source_metadata.st_mtime_ns),
+        )
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def restore_database_from_backup(source: Path, destination: Path) -> None:
+    validate_state_db_path(source)
+    if destination.is_symlink():
+        raise MigrationError(f"refusing symlinked state database: {destination}")
+    if destination.exists() and not destination.is_file():
+        raise MigrationError(f"state database is not a file: {destination}")
+    if not destination.parent.is_dir() or destination.parent.is_symlink():
+        raise MigrationError(
+            f"SQLite restore directory is missing or unsafe: {destination.parent}"
+        )
+
+    source_metadata = source.stat()
+    destination_existed = destination.is_file()
+    source_connection = sqlite3.connect(
+        sqlite_read_only_uri(source, immutable=True), uri=True
+    )
+    destination_connection = sqlite3.connect(destination)
+    try:
+        source_settings = read_persistent_sqlite_settings(source_connection)
+        source_settings["journal_mode"] = sqlite_header_journal_mode(source)
+        source_connection.backup(destination_connection)
+    finally:
+        destination_connection.close()
+        source_connection.close()
+
+    normalize_database_backup_settings(destination, source_settings)
+    if not destination_existed:
+        set_file_owner(
+            destination, source_metadata.st_uid, source_metadata.st_gid
+        )
+    os.chmod(destination, stat.S_IMODE(source_metadata.st_mode))
+    os.utime(
+        destination,
+        ns=(source_metadata.st_atime_ns, source_metadata.st_mtime_ns),
+    )
+    with destination.open("rb") as stream:
+        os.fsync(stream.fileno())
+
+
+def verify_restored_state(
+    *,
+    backup_dir: Path,
+    codex_home: Path,
+    sqlite_home: Path,
+    manifest: dict[str, Any],
+) -> RestorationReport:
+    source_provider = manifest["source_provider"]
+    db_name = manifest["state_db_name"]
+    backup_paths = {
+        relative_rollout_path(backup_dir, path): path
+        for path in rollout_paths(backup_dir)
+    }
+    restored_paths = {
+        relative_rollout_path(codex_home, path): path
+        for path in rollout_paths(codex_home)
+    }
+    if backup_paths.keys() != restored_paths.keys():
+        raise MigrationError("rollout file set differs after restoration")
+
+    for relative, source in backup_paths.items():
+        destination = restored_paths[relative]
+        if source.read_bytes() != destination.read_bytes():
+            raise MigrationError(f"restored rollout differs: {relative}")
+        source_stat = source.stat()
+        destination_stat = destination.stat()
+        if stat.S_IMODE(source_stat.st_mode) != stat.S_IMODE(
+            destination_stat.st_mode
+        ):
+            raise MigrationError(f"restored rollout mode differs: {relative}")
+        if (source_stat.st_uid, source_stat.st_gid) != (
+            destination_stat.st_uid,
+            destination_stat.st_gid,
+        ):
+            raise MigrationError(f"restored rollout ownership differs: {relative}")
+        if source_stat.st_mtime_ns != destination_stat.st_mtime_ns:
+            raise MigrationError(f"restored rollout mtime differs: {relative}")
+
+    config_backup = backup_dir / "config.toml"
+    config_current = codex_home / "config.toml"
+    config_restored = manifest["artifacts"]["config"]["present"]
+    if config_restored:
+        if not config_current.is_file() or (
+            config_backup.read_bytes() != config_current.read_bytes()
+        ):
+            raise MigrationError("config.toml differs after restoration")
+        backup_stat = config_backup.stat()
+        current_stat = config_current.stat()
+        if stat.S_IMODE(backup_stat.st_mode) != stat.S_IMODE(current_stat.st_mode):
+            raise MigrationError("config.toml mode differs after restoration")
+        if (backup_stat.st_uid, backup_stat.st_gid) != (
+            current_stat.st_uid,
+            current_stat.st_gid,
+        ):
+            raise MigrationError("config.toml ownership differs after restoration")
+        if backup_stat.st_mtime_ns != current_stat.st_mtime_ns:
+            raise MigrationError("config.toml mtime differs after restoration")
+    elif config_current.exists() or config_current.is_symlink():
+        raise MigrationError("config.toml should be absent after restoration")
+
+    database_path = sqlite_home / db_name
+    tables, rows, _ = compare_sqlite_databases(
+        backup_dir / db_name,
+        database_path,
+        source_provider,
+        source_provider,
+    )
+    backup_database_stat = (backup_dir / db_name).stat()
+    restored_database_stat = database_path.stat()
+    if stat.S_IMODE(backup_database_stat.st_mode) != stat.S_IMODE(
+        restored_database_stat.st_mode
+    ):
+        raise MigrationError("SQLite mode differs after restoration")
+    if (backup_database_stat.st_uid, backup_database_stat.st_gid) != (
+        restored_database_stat.st_uid,
+        restored_database_stat.st_gid,
+    ):
+        raise MigrationError("SQLite ownership differs after restoration")
+    if backup_database_stat.st_mtime_ns != restored_database_stat.st_mtime_ns:
+        raise MigrationError("SQLite mtime differs after restoration")
+    return RestorationReport(
+        rollout_files_restored=len(backup_paths),
+        config_restored=config_restored,
+        sqlite_tables_checked=tables,
+        sqlite_rows_checked=rows,
+    )
+
+
+def restore_original_state(
+    *,
+    backup_dir: Path,
+    codex_home: Path,
+    sqlite_home: Path,
+    manifest: dict[str, Any],
+) -> RestorationReport:
+    ensure_supported_storage(codex_home, sqlite_home)
+    ensure_supported_storage(backup_dir, backup_dir)
+    verify_recoverable_state(
+        backup_dir=backup_dir,
+        codex_home=codex_home,
+        sqlite_home=sqlite_home,
+        manifest=manifest,
+    )
+    backup_paths = {
+        relative_rollout_path(backup_dir, path): path
+        for path in rollout_paths(backup_dir)
+    }
+    current_paths = {
+        relative_rollout_path(codex_home, path): path
+        for path in rollout_paths(codex_home)
+    }
+    if backup_paths.keys() != current_paths.keys():
+        raise MigrationError(
+            "refusing restoration because the rollout file set has changed"
+        )
+
+    config_current = codex_home / "config.toml"
+    config_expected = manifest["artifacts"]["config"]["present"]
+    if config_current.is_symlink() or (
+        config_current.exists() and not config_current.is_file()
+    ):
+        raise MigrationError(
+            f"refusing unsafe config restore destination: {config_current}"
+        )
+    if not config_expected and config_current.exists():
+        raise MigrationError(
+            "refusing restoration because config.toml was absent from the backup"
+        )
+
+    db_name = manifest["state_db_name"]
+    database_path = sqlite_home / db_name
+    validate_state_db_path(database_path)
+    database_is_original = False
+    try:
+        compare_sqlite_databases(
+            backup_dir / db_name,
+            database_path,
+            manifest["source_provider"],
+            manifest["source_provider"],
+        )
+        expected_database_metadata = {
+            key: manifest["artifacts"]["database"][key]
+            for key in ("mode", "uid", "gid", "mtime_ns")
+        }
+        database_is_original = (
+            capture_file_metadata(database_path) == expected_database_metadata
+        )
+    except (MigrationError, sqlite3.Error):
+        pass
+
+    for relative, source in backup_paths.items():
+        restore_file_from_backup(source, current_paths[relative])
+
+    config_backup = backup_dir / "config.toml"
+    if config_expected:
+        restore_file_from_backup(config_backup, config_current)
+
+    if not database_is_original:
+        restore_database_from_backup(
+            backup_dir / db_name,
+            database_path,
+        )
+    return verify_restored_state(
+        backup_dir=backup_dir,
+        codex_home=codex_home,
+        sqlite_home=sqlite_home,
+        manifest=manifest,
+    )
+
+
+def restore_from_backup(
+    *,
+    backup_dir: Path,
+    codex_home: Path | None = None,
+    sqlite_home: Path | None = None,
+    confirm_stopped: bool,
+) -> RestorationReport:
+    if not confirm_stopped:
+        raise MigrationError("--confirm-codex-stopped is required for restoration")
+    backup_dir = backup_dir.resolve()
+    manifest = load_backup_manifest(backup_dir)
+    status = manifest.get("status")
+    if status not in {"complete", "prepared", "restoring"}:
+        raise MigrationError(
+            "backup manifest is not in a restorable state"
+        )
+    codex_home = (codex_home or Path(manifest["codex_home"])).resolve()
+    sqlite_home = (sqlite_home or Path(manifest["sqlite_home"])).resolve()
+    if not codex_home.is_dir() or not sqlite_home.is_dir():
+        raise MigrationError("recorded Codex or SQLite state directory is missing")
+    for state_root in {codex_home, sqlite_home}:
+        if (
+            backup_dir == state_root
+            or backup_dir.is_relative_to(state_root)
+            or state_root.is_relative_to(backup_dir)
+        ):
+            raise MigrationError("backup directory must be outside Codex state")
+    open_processes = find_processes_with_open_state(codex_home, sqlite_home)
+    if open_processes:
+        rendered = ", ".join(str(pid) for pid in open_processes)
+        raise MigrationError(
+            f"processes still have Codex state open (PIDs: {rendered}); stop them first"
+        )
+    if status == "complete":
+        # Before the first undo attempt, require the exact completed migration
+        # so later Codex activity cannot be overwritten.
+        verify_against_backup(
+            backup_dir=backup_dir,
+            codex_home=codex_home,
+            sqlite_home=sqlite_home,
+        )
+    else:
+        # A hard process interruption can leave a prepared migration or a
+        # restore half complete. Resume only if each artifact is one of the two
+        # exact states already proven by this backup.
+        verify_recoverable_state(
+            backup_dir=backup_dir,
+            codex_home=codex_home,
+            sqlite_home=sqlite_home,
+            manifest=manifest,
+        )
+
+    manifest["status"] = "restoring"
+    manifest["restoration_started_at"] = dt.datetime.now(
+        dt.timezone.utc
+    ).isoformat()
+    try:
+        write_json_atomic(backup_dir / MANIFEST_NAME, manifest)
+    except (OSError, ValueError) as exc:
+        raise MigrationError(
+            "could not mark the backup as restoring; no restoration was attempted"
+        ) from exc
+
+    report = restore_original_state(
+        backup_dir=backup_dir,
+        codex_home=codex_home,
+        sqlite_home=sqlite_home,
+        manifest=manifest,
+    )
+    manifest["status"] = "restored"
+    manifest["restored_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+    manifest["restoration_report"] = dataclasses.asdict(report)
+    try:
+        write_json_atomic(backup_dir / MANIFEST_NAME, manifest)
+    except (OSError, ValueError) as exc:
+        raise MigrationError(
+            "restoration was verified, but the backup manifest could not be updated"
+        ) from exc
+    return report
+
+
+def apply_migration(
+    *,
+    codex_home: Path,
+    sqlite_home: Path,
+    backup_dir: Path,
+    source_provider: str,
+    target_provider: str,
+    migrate_config: bool,
+    confirm_stopped: bool,
+) -> VerificationReport:
+    if not confirm_stopped:
+        raise MigrationError("--confirm-codex-stopped is required with --apply")
+    resolved_backup = backup_dir.resolve()
+    for state_root in {codex_home.resolve(), sqlite_home.resolve()}:
+        if resolved_backup == state_root or resolved_backup.is_relative_to(state_root):
+            raise MigrationError(
+                f"backup directory must be outside Codex state: {backup_dir}"
+            )
+    utility_root = Path(__file__).resolve().parent
+    if resolved_backup == utility_root or resolved_backup.is_relative_to(utility_root):
+        raise MigrationError(
+            "backup directory must be outside the migration utility checkout: "
+            f"{backup_dir}"
+        )
+    open_processes = find_processes_with_open_state(codex_home, sqlite_home)
+    if open_processes:
+        rendered = ", ".join(str(pid) for pid in open_processes)
+        raise MigrationError(
+            f"processes still have Codex state open (PIDs: {rendered}); stop them first"
+        )
+
+    ensure_supported_storage(codex_home, sqlite_home)
+    db_path = sqlite_home / STATE_DB_NAME
+    require_writable_database(db_path)
+    rollout_analysis = analyze_rollouts(codex_home, source_provider)
+    database_analysis = analyze_database(db_path, source_provider)
+    config_path = codex_home / "config.toml"
+    config_before = config_path.read_bytes() if config_path.is_file() else None
+    config_after = None
+    if migrate_config:
+        if config_before is None:
+            raise MigrationError("config.toml is missing")
+        config_after = transform_config(
+            config_before, source_provider, target_provider
+        )
+
+    manifest = create_backup(
+        codex_home=codex_home,
+        sqlite_home=sqlite_home,
+        db_path=db_path,
+        backup_dir=backup_dir,
+        source_provider=source_provider,
+        target_provider=target_provider,
+        rollout_analysis=rollout_analysis,
+        database_analysis=database_analysis,
+        migrate_config=migrate_config,
+    )
+
+    current_analysis = analyze_rollouts(codex_home, source_provider)
+    if (
+        current_analysis.file_hashes != rollout_analysis.file_hashes
+        or current_analysis.file_metadata != rollout_analysis.file_metadata
+    ):
+        raise MigrationError(
+            "rollout state changed after backup; no migration was applied"
+        )
+    if config_before is None:
+        if config_path.exists() or config_path.is_symlink():
+            raise MigrationError(
+                "config.toml appeared after backup; no migration was applied"
+            )
+    elif config_path.read_bytes() != config_before:
+        raise MigrationError(
+            "config.toml changed after backup; no migration was applied"
+        )
+    elif capture_file_metadata(config_path) != {
+        key: manifest["artifacts"]["config"][key]
+        for key in ("mode", "uid", "gid", "mtime_ns")
+    }:
+        raise MigrationError(
+            "config.toml metadata changed after backup; no migration was applied"
+        )
+    if analyze_database(db_path, source_provider) != database_analysis:
+        raise MigrationError(
+            "SQLite state changed after backup; no migration was applied"
+        )
+    compare_sqlite_databases(
+        backup_dir / db_path.name,
+        db_path,
+        source_provider,
+        source_provider,
+    )
+    if capture_file_metadata(db_path) != {
+        key: manifest["artifacts"]["database"][key]
+        for key in ("mode", "uid", "gid", "mtime_ns")
+    }:
+        raise MigrationError(
+            "SQLite metadata changed after backup; no migration was applied"
+        )
+
+    # Roll back on ordinary failures and operator interruption alike. Once the
+    # first atomic replacement starts, returning without attempting recovery
+    # would leave the cross-file migration in an unknown partial state.
+    try:
+        changed_files = 0
+        changed_records = 0
+        for path in rollout_paths(codex_home):
+            original = path.read_bytes()
+            updated, replacements = replace_provider_bytes(
+                original, source_provider, target_provider
+            )
+            if replacements:
+                atomic_write(path, updated, preserve_mtime=True)
+                changed_files += 1
+                changed_records += replacements
+        if changed_files != rollout_analysis.files_requiring_changes:
+            raise MigrationError("changed rollout file count does not match preflight")
+        if changed_records != rollout_analysis.replacements:
+            raise MigrationError(
+                "changed rollout record count does not match preflight"
+            )
+
+        connection = sqlite3.connect(db_path)
+        try:
+            connection.execute("PRAGMA busy_timeout = 5000")
+            connection.execute("BEGIN IMMEDIATE")
+            current_rows = connection.execute(
+                "SELECT count(*) FROM threads WHERE model_provider = ?",
+                (source_provider,),
+            ).fetchone()[0]
+            if current_rows != database_analysis.rows_from_provider:
+                connection.rollback()
+                raise MigrationError("SQLite provider row count changed after backup")
+            updated_rows = connection.execute(
+                "UPDATE threads SET model_provider = ? WHERE model_provider = ?",
+                (target_provider, source_provider),
+            ).rowcount
+            if updated_rows != database_analysis.rows_from_provider:
+                connection.rollback()
+                raise MigrationError("SQLite update count does not match preflight")
+            connection.commit()
+        finally:
+            connection.close()
+        os.chmod(db_path, manifest["artifacts"]["database"]["mode"])
+
+        if config_after is not None:
+            atomic_write(config_path, config_after, preserve_mtime=False)
+
+        report = verify_against_backup(
+            backup_dir=backup_dir,
+            codex_home=codex_home,
+            sqlite_home=sqlite_home,
+        )
+        manifest["status"] = "complete"
+        manifest["completed_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+        manifest["verification_report"] = dataclasses.asdict(report)
+        write_json_atomic(backup_dir / MANIFEST_NAME, manifest)
+        return report
+    except BaseException as migration_error:
+        try:
+            rollback_report = restore_original_state(
+                backup_dir=backup_dir,
+                codex_home=codex_home,
+                sqlite_home=sqlite_home,
+                manifest=manifest,
+            )
+        except BaseException as rollback_error:
+            raise MigrationError(
+                "migration failed and automatic rollback also failed; "
+                f"migration error: {migration_error}; rollback error: {rollback_error}"
+            ) from rollback_error
+        manifest["status"] = "rolled_back"
+        manifest["rolled_back_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+        manifest["rollback_report"] = dataclasses.asdict(rollback_report)
+        try:
+            write_json_atomic(backup_dir / MANIFEST_NAME, manifest)
+        except BaseException as manifest_error:
+            raise MigrationError(
+                "migration failed and automatic rollback was verified, but the "
+                "backup manifest could not be updated; "
+                f"migration error: {migration_error}"
+            ) from manifest_error
+        raise
+
+
+def default_codex_home() -> Path:
+    configured = os.environ.get("CODEX_HOME")
+    return Path(configured) if configured else Path.home() / ".codex"
+
+
+def default_sqlite_home(codex_home: Path) -> Path:
+    configured = os.environ.get("CODEX_SQLITE_HOME")
+    return Path(configured) if configured else codex_home
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--version", action="version", version=TOOL_VERSION)
+    parser.add_argument(
+        "--codex-home",
+        type=Path,
+        default=default_codex_home(),
+        help="Codex state directory (default: CODEX_HOME or ~/.codex)",
+    )
+    parser.add_argument(
+        "--sqlite-home",
+        type=Path,
+        help=(
+            "directory containing state_5.sqlite "
+            "(default: CODEX_SQLITE_HOME or Codex state)"
+        ),
+    )
+    parser.add_argument(
+        "--from-provider",
+        required=True,
+        help="custom model_provider ID currently stored in sessions",
+    )
+    parser.add_argument(
+        "--to-provider",
+        default="openai",
+        help="replacement provider ID (default: openai)",
+    )
+    parser.add_argument(
+        "--migrate-config",
+        action="store_true",
+        help="convert a compatible custom provider to openai_base_url",
+    )
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="write the migration; without this flag Codex records are unchanged",
+    )
+    parser.add_argument(
+        "--backup-dir",
+        type=Path,
+        help="new private backup directory outside Codex state and this checkout",
+    )
+    parser.add_argument(
+        "--confirm-codex-stopped",
+        action="store_true",
+        help="confirm all Codex CLI, extension, and app-server processes are stopped",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="emit machine-readable JSON",
+    )
+    return parser
+
+
+def emit(value: dict[str, Any], as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(value, indent=2, sort_keys=True))
+        return
+    for key, item in value.items():
+        print(f"{key}: {item}")
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        codex_home = args.codex_home.resolve()
+        sqlite_home = (args.sqlite_home or default_sqlite_home(codex_home)).resolve()
+        if args.from_provider == args.to_provider:
+            raise MigrationError("source and target provider are identical")
+        if not codex_home.is_dir():
+            raise MigrationError(f"Codex home does not exist: {codex_home}")
+        ensure_supported_storage(codex_home, sqlite_home)
+        db_path = sqlite_home / STATE_DB_NAME
+
+        if args.apply:
+            if args.backup_dir is None:
+                raise MigrationError("--backup-dir is required with --apply")
+            report = apply_migration(
+                codex_home=codex_home,
+                sqlite_home=sqlite_home,
+                backup_dir=args.backup_dir.resolve(),
+                source_provider=args.from_provider,
+                target_provider=args.to_provider,
+                migrate_config=args.migrate_config,
+                confirm_stopped=args.confirm_codex_stopped,
+            )
+            emit(
+                {
+                    "result": "migration and verification passed",
+                    "backup_dir": str(args.backup_dir.resolve()),
+                    **dataclasses.asdict(report),
+                },
+                args.json,
+            )
+            return 0
+
+        rollout = analyze_rollouts(codex_home, args.from_provider)
+        database = analyze_database(db_path, args.from_provider)
+        config_status = "not requested"
+        if args.migrate_config:
+            config_path = codex_home / "config.toml"
+            transform_config(
+                config_path.read_bytes(), args.from_provider, args.to_provider
+            )
+            config_status = "eligible"
+        emit(
+            {
+                "result": "dry run; no Codex records changed",
+                "sqlite_note": (
+                    "read-only WAL access may create SQLite coordination sidecars"
+                ),
+                "codex_home": str(codex_home),
+                "sqlite_home": str(sqlite_home),
+                "from_provider": args.from_provider,
+                "to_provider": args.to_provider,
+                "config_migration": config_status,
+                **{
+                    key: value
+                    for key, value in dataclasses.asdict(rollout).items()
+                    if key not in {"file_hashes", "file_metadata"}
+                },
+                **dataclasses.asdict(database),
+            },
+            args.json,
+        )
+        return 0
+    except (MigrationError, OSError, ValueError, sqlite3.Error) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        if args.apply and args.backup_dir and args.backup_dir.exists():
+            print(
+                "backup/recovery data may be available at: "
+                f"{args.backup_dir.resolve()}",
+                file=sys.stderr,
+            )
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
