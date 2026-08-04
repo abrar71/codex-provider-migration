@@ -205,6 +205,43 @@ class ProviderMigrationTests(unittest.TestCase):
             (self.fixture.codex_home / "config.toml").read_bytes(), config_before
         )
 
+    def test_process_classifier_ignores_docker_codex_mount_arguments(self) -> None:
+        cases = (
+            (["/usr/local/bin/codex", "exec"], True),
+            (["C:\\Tools\\codex.exe", "app-server"], True),
+            (["node", "/usr/lib/node_modules/@openai/codex/bin/codex.js"], True),
+            (["node", "codex.js", "resume"], True),
+            (
+                [
+                    "docker",
+                    "run",
+                    "--pid=host",
+                    "--mount",
+                    "type=bind,src=/state,dst=/codex",
+                    "codex-provider-migration:local",
+                    "migrate",
+                    "--codex-home",
+                    "/codex",
+                ],
+                False,
+            ),
+            (
+                [
+                    "python3",
+                    "/opt/codex-provider-migration/migrate.py",
+                    "--codex-home",
+                    "/codex",
+                ],
+                False,
+            ),
+            ([], False),
+        )
+        for command_args, expected in cases:
+            with self.subTest(command_args=command_args):
+                self.assertEqual(
+                    migrate.command_looks_like_codex(command_args), expected
+                )
+
     def test_wal_dry_run_preserves_main_database_and_limits_side_effects(self) -> None:
         database = self.fixture.sqlite_home / migrate.STATE_DB_NAME
         connection = sqlite3.connect(database)

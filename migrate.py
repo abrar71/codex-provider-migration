@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any
 
 
-TOOL_VERSION = "1.0.0"
+TOOL_VERSION = "1.0.1"
 MANIFEST_VERSION = 2
 MANIFEST_NAME = "migration-manifest.json"
 STATE_DB_NAME = "state_5.sqlite"
@@ -660,6 +660,25 @@ def atomic_write(
         temporary.unlink(missing_ok=True)
 
 
+def command_looks_like_codex(command_args: list[str]) -> bool:
+    if not command_args:
+        return False
+
+    normalized = [argument.replace("\\", "/").lower() for argument in command_args]
+    executable_name = normalized[0].rsplit("/", 1)[-1]
+    if executable_name in {"codex", "codex.exe", "codex.js"}:
+        return True
+
+    # Only JavaScript entrypoints and package paths are meaningful after argv[0].
+    # A generic argument named `codex` may instead be a bind-mount destination or
+    # the value of --codex-home in a Docker invocation.
+    return any(
+        argument.rsplit("/", 1)[-1] == "codex.js"
+        or "/@openai/codex/" in argument
+        for argument in normalized[1:]
+    )
+
+
 def find_processes_with_open_state(codex_home: Path, sqlite_home: Path) -> list[int]:
     proc = Path("/proc")
     if not proc.is_dir():
@@ -680,11 +699,7 @@ def find_processes_with_open_state(codex_home: Path, sqlite_home: Path) -> list[
                 for value in (entry / "cmdline").read_bytes().split(b"\0")
                 if value
             ]
-            looks_like_codex = any(
-                Path(argument).name.lower() in {"codex", "codex.exe", "codex.js"}
-                or "/@openai/codex/" in argument.replace("\\", "/").lower()
-                for argument in command_args
-            )
+            looks_like_codex = command_looks_like_codex(command_args)
         except (FileNotFoundError, PermissionError, OSError):
             pass
         fd_root = entry / "fd"
