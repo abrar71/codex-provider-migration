@@ -6,6 +6,7 @@ import os
 import re
 import sqlite3
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -1247,6 +1248,33 @@ class ProviderMigrationTests(unittest.TestCase):
             self.assertEqual(raised.exception.code, 0)
             self.assertEqual(output.getvalue().strip(), migrate.TOOL_VERSION)
 
+    def test_container_entrypoint_dispatches_all_commands(self) -> None:
+        environment = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+        entrypoint = REPO_ROOT / "docker_entrypoint.py"
+        for command in ("migrate", "verify", "restore"):
+            completed = subprocess.run(
+                [sys.executable, "-B", str(entrypoint), command, "--version"],
+                cwd=REPO_ROOT,
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(completed.stdout.strip(), migrate.TOOL_VERSION)
+
+        rejected = subprocess.run(
+            [sys.executable, "-B", str(entrypoint), "unknown"],
+            cwd=REPO_ROOT,
+            env=environment,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(rejected.returncode, 2)
+        self.assertIn("unknown container command", rejected.stderr)
+        self.assertNotIn("Traceback", rejected.stderr)
+
     def test_verifier_cli_reports_corrupt_manifest_without_traceback(self) -> None:
         self.fixture.backup_dir.mkdir()
         (self.fixture.backup_dir / migrate.MANIFEST_NAME).write_bytes(b"\xff")
@@ -1266,9 +1294,12 @@ class ProviderMigrationTests(unittest.TestCase):
             re.compile(r"[A-Za-z]:\\" + r"Users\\[^\\\s]+\\"),
         )
         public_files = [
+            REPO_ROOT / ".dockerignore",
             REPO_ROOT / ".gitignore",
+            REPO_ROOT / "Dockerfile",
             REPO_ROOT / "Makefile",
             REPO_ROOT / "README.md",
+            REPO_ROOT / "docker_entrypoint.py",
             REPO_ROOT / "migrate.py",
             REPO_ROOT / "restore.py",
             REPO_ROOT / "verify.py",

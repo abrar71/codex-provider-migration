@@ -1,0 +1,6 @@
+**
+!Dockerfile
+!docker_entrypoint.py
+!migrate.py
+!restore.py
+!verify.py

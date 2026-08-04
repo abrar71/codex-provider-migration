@@ -88,6 +88,107 @@ tool also checks `/proc` for processes that appear to have Codex state open. On
 systems without `/proc`, `--confirm-codex-stopped` remains an explicit promise
 from the operator rather than a process-level guarantee.
 
+## Docker
+
+Build the local image from the repository checkout:
+
+```bash
+docker build -t codex-provider-migration:local .
+# Equivalent: make docker-build
+```
+
+The image has three subcommands: `migrate`, `verify`, and `restore`. The
+container makes no network requests at runtime, and the commands below disable
+container networking explicitly. Its build context is restricted to the four
+Python scripts and `Dockerfile`, so local Codex state and backups cannot be
+copied into the image accidentally. Run `make docker-check` to build the image
+and smoke-test all three subcommands without network access.
+
+Set the host state path, then perform a dry run with the state mounted at
+`/codex`:
+
+```bash
+image="codex-provider-migration:local"
+codex_state_dir="${CODEX_HOME:-${HOME}/.codex}"
+
+docker run --rm \
+  --network none \
+  --user "$(id -u):$(id -g)" \
+  --mount "type=bind,src=${codex_state_dir},dst=/codex" \
+  "$image" migrate \
+  --codex-home /codex \
+  --sqlite-home /codex \
+  --from-provider proxy \
+  --to-provider openai \
+  --migrate-config
+```
+
+The state mount is intentionally writable because SQLite may create WAL
+coordination sidecars during otherwise read-only validation. On systems where
+Docker does not support host numeric user IDs, omit `--user`; be aware that a
+root container can leave the new backup owned by root.
+
+To apply, mount a backup *parent* directory and pass a child path that does not
+exist yet. Stop every Codex process first:
+
+```bash
+backup_parent="${HOME}/codex-provider-backups"
+backup_name="codex-provider-backup-$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p "$backup_parent"
+
+docker run --rm \
+  --network none \
+  --pid=host \
+  --user "$(id -u):$(id -g)" \
+  --mount "type=bind,src=${codex_state_dir},dst=/codex" \
+  --mount "type=bind,src=${backup_parent},dst=/backups" \
+  "$image" migrate \
+  --codex-home /codex \
+  --sqlite-home /codex \
+  --from-provider proxy \
+  --to-provider openai \
+  --migrate-config \
+  --apply \
+  --confirm-codex-stopped \
+  --backup-dir "/backups/${backup_name}"
+```
+
+`--pid=host` improves host-process detection on Linux; it is not available with
+every Docker runtime and does not replace the requirement to stop Codex. If the
+SQLite state is separate, add another bind mount at `/sqlite` and use
+`--sqlite-home /sqlite`.
+
+Re-run verification with the same state and backup mounts:
+
+```bash
+docker run --rm \
+  --network none \
+  --user "$(id -u):$(id -g)" \
+  --mount "type=bind,src=${codex_state_dir},dst=/codex" \
+  --mount "type=bind,src=${backup_parent},dst=/backups,readonly" \
+  "$image" verify \
+  --backup-dir "/backups/${backup_name}" \
+  --codex-home /codex \
+  --sqlite-home /codex
+```
+
+To undo a completed migration, stop Codex and use a writable backup mount so
+the manifest can record recovery progress:
+
+```bash
+docker run --rm \
+  --network none \
+  --pid=host \
+  --user "$(id -u):$(id -g)" \
+  --mount "type=bind,src=${codex_state_dir},dst=/codex" \
+  --mount "type=bind,src=${backup_parent},dst=/backups" \
+  "$image" restore \
+  --backup-dir "/backups/${backup_name}" \
+  --codex-home /codex \
+  --sqlite-home /codex \
+  --confirm-codex-stopped
+```
+
 ## 1. Dry run
 
 Clone the public repository, then run the dry-run validation:
