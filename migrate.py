@@ -3,13 +3,14 @@
 
 The command does not change Codex records unless --apply is supplied. A
 read-only SQLite open may create standard WAL coordination sidecars. The tool
-intentionally refuses compressed or paginated rollouts because changing JSONL
-byte lengths could invalidate history offsets in those formats.
+refuses compressed rollouts and unknown paginated schemas; for the supported
+thread-history schema it migrates and exhaustively verifies stored byte offsets.
 """
 
 from __future__ import annotations
 
 import argparse
+import bisect
 import collections
 import copy
 import dataclasses
@@ -28,10 +29,12 @@ from pathlib import Path
 from typing import Any
 
 
-TOOL_VERSION = "1.0.1"
-MANIFEST_VERSION = 2
+TOOL_VERSION = "1.1.0"
+MANIFEST_VERSION = 3
+LEGACY_MANIFEST_VERSION = 2
 MANIFEST_NAME = "migration-manifest.json"
 STATE_DB_NAME = "state_5.sqlite"
+HISTORY_DB_NAME = "thread_history_1.sqlite"
 SESSION_DIR_NAMES = ("sessions", "archived_sessions")
 PROVIDER_KEYS = ("model_provider", "model_provider_id")
 KNOWN_PROVIDER_PATHS = {
@@ -80,6 +83,27 @@ class DatabaseAnalysis:
 
 
 @dataclasses.dataclass(frozen=True)
+class HistoryDatabaseAnalysis:
+    present: bool
+    integrity_check: str
+    tables: int
+    rows: int
+    paginated_threads: int
+    offset_fields_to_update: int
+    persistent_settings: dict[str, int | str]
+
+
+@dataclasses.dataclass(frozen=True)
+class HistoryOffsetUpdate:
+    table: str
+    key_columns: tuple[str, ...]
+    key_values: tuple[str, ...]
+    offset_column: str
+    original_offset: int
+    migrated_offset: int
+
+
+@dataclasses.dataclass(frozen=True)
 class VerificationReport:
     rollout_files_checked: int
     changed_rollout_files: int
@@ -91,6 +115,9 @@ class VerificationReport:
     sqlite_tables_checked: int
     sqlite_rows_checked: int
     sqlite_thread_rows_changed: int
+    history_sqlite_tables_checked: int
+    history_sqlite_rows_checked: int
+    history_offset_fields_changed: int
     config_matches_expected: bool
 
 
@@ -100,6 +127,9 @@ class RestorationReport:
     config_restored: bool
     sqlite_tables_checked: int
     sqlite_rows_checked: int
+    history_database_restored: bool
+    history_sqlite_tables_checked: int
+    history_sqlite_rows_checked: int
 
 
 def sha256_bytes(value: bytes) -> str:
@@ -253,22 +283,35 @@ def structural_provider_changes(record: Any, source_provider: str) -> tuple[int,
     return session_meta, thread_settings
 
 
-def assert_legacy_rollout(record: Any, path: Path, line_number: int) -> None:
+def assert_supported_rollout(
+    record: Any,
+    path: Path,
+    line_number: int,
+    *,
+    allow_paginated: bool,
+) -> None:
     if not isinstance(record, dict) or record.get("type") != "session_meta":
         return
     payload = record.get("payload")
     if not isinstance(payload, dict):
         return
-    if (
-        payload.get("history_mode") == "paginated"
-        or payload.get("history_base") is not None
-    ):
+    if payload.get("history_base") is not None:
         raise MigrationError(
-            f"refusing paginated/history_base rollout at {path}:{line_number}"
+            f"refusing history_base rollout at {path}:{line_number}"
+        )
+    if payload.get("history_mode") == "paginated" and not allow_paginated:
+        raise MigrationError(
+            "refusing paginated rollout without a supported thread-history "
+            f"database at {path}:{line_number}"
         )
 
 
-def analyze_rollouts(codex_home: Path, source_provider: str) -> RolloutAnalysis:
+def analyze_rollouts(
+    codex_home: Path,
+    source_provider: str,
+    *,
+    allow_paginated: bool = False,
+) -> RolloutAnalysis:
     files = rollout_paths(codex_home)
     file_hashes: dict[str, str] = {}
     file_metadata: dict[str, dict[str, int]] = {}
@@ -305,7 +348,12 @@ def analyze_rollouts(codex_home: Path, source_provider: str) -> RolloutAnalysis:
                 continue
 
             valid_lines += 1
-            assert_legacy_rollout(record, path, line_number)
+            assert_supported_rollout(
+                record,
+                path,
+                line_number,
+                allow_paginated=allow_paginated,
+            )
             unknown_paths = walk_provider_values(record, source_provider)
             if unknown_paths:
                 rendered = ", ".join(".".join(item) for item in unknown_paths)
@@ -363,10 +411,12 @@ def ensure_supported_storage(codex_home: Path, sqlite_home: Path) -> None:
         compressed.extend(root.rglob("*.gz"))
     if compressed:
         raise MigrationError(f"refusing compressed rollout: {sorted(compressed)[0]}")
-    history_db = sqlite_home / "thread_history_1.sqlite"
-    if history_db.exists():
+    history_db = sqlite_home / HISTORY_DB_NAME
+    if history_db.is_symlink():
+        raise MigrationError(f"refusing symlinked thread-history database: {history_db}")
+    if history_db.exists() and not history_db.is_file():
         raise MigrationError(
-            f"refusing paginated thread-history database: {history_db}"
+            f"thread-history database is not a regular file: {history_db}"
         )
 
 
@@ -497,7 +547,450 @@ def analyze_database(db_path: Path, source_provider: str) -> DatabaseAnalysis:
     )
 
 
-def require_writable_database(db_path: Path) -> None:
+def rollout_line_boundaries(value: bytes) -> dict[int, int]:
+    """Map each byte boundary between JSONL records to its next ordinal."""
+
+    boundaries = {0: 0}
+    offset = 0
+    for ordinal, line in enumerate(value.splitlines(keepends=True), 1):
+        offset += len(line)
+        boundaries[offset] = ordinal
+    return boundaries
+
+
+def provider_match_positions(value: bytes, source_provider: str) -> list[int]:
+    positions = [
+        match.start()
+        for key in PROVIDER_KEYS
+        for match in provider_pattern(key, source_provider).finditer(value)
+    ]
+    return sorted(positions)
+
+
+def resolve_recorded_rollout_path(codex_home: Path, recorded: Any) -> Path:
+    if not isinstance(recorded, str) or not recorded or "\x00" in recorded:
+        raise MigrationError("invalid threads.rollout_path in state database")
+    # A state database created on the host can be inspected from a Linux
+    # container, so recognize either path separator before retaining only the
+    # session-root-relative suffix.
+    recorded_path = Path(recorded.replace("\\", "/"))
+    marker_indices = [
+        index
+        for index, part in enumerate(recorded_path.parts)
+        if part in SESSION_DIR_NAMES
+    ]
+    if marker_indices:
+        relative = Path(*recorded_path.parts[marker_indices[-1] :])
+        candidate = codex_home / relative
+    elif recorded_path.is_absolute():
+        try:
+            relative = recorded_path.resolve().relative_to(codex_home.resolve())
+        except ValueError as exc:
+            raise MigrationError(
+                f"threads.rollout_path is outside recognizable session roots: {recorded}"
+            ) from exc
+        candidate = codex_home / relative
+    else:
+        candidate = codex_home / recorded_path
+
+    resolved_home = codex_home.resolve()
+    resolved = candidate.resolve()
+    try:
+        resolved.relative_to(resolved_home)
+    except ValueError as exc:
+        raise MigrationError(
+            f"threads.rollout_path escapes Codex state: {recorded}"
+        ) from exc
+    current = codex_home
+    relative_candidate = candidate.relative_to(codex_home)
+    for part in relative_candidate.parts:
+        current /= part
+        if current.is_symlink():
+            raise MigrationError(
+                f"recorded paginated rollout traverses a symlink: {candidate}"
+            )
+    if not candidate.is_file():
+        raise MigrationError(
+            f"recorded paginated rollout is missing or unsafe: {candidate}"
+        )
+    return candidate
+
+
+def rollout_contains_paginated_thread(path: Path, thread_id: str) -> bool:
+    for line in path.read_bytes().splitlines():
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        if not isinstance(record, dict) or record.get("type") != "session_meta":
+            continue
+        payload = record.get("payload")
+        if (
+            isinstance(payload, dict)
+            and payload.get("id") == thread_id
+            and payload.get("history_mode") == "paginated"
+            and payload.get("history_base") is None
+        ):
+            return True
+    return False
+
+
+def quoted_identifier(value: str) -> str:
+    return '"' + value.replace('"', '""') + '"'
+
+
+def inspect_history_database(
+    history_db_path: Path,
+    state_db_path: Path,
+    codex_home: Path,
+    source_provider: str,
+    target_provider: str,
+    *,
+    immutable: bool = False,
+) -> tuple[HistoryDatabaseAnalysis, list[HistoryOffsetUpdate]]:
+    if not history_db_path.exists():
+        return (
+            HistoryDatabaseAnalysis(
+                present=False,
+                integrity_check="not present",
+                tables=0,
+                rows=0,
+                paginated_threads=0,
+                offset_fields_to_update=0,
+                persistent_settings={},
+            ),
+            [],
+        )
+    if history_db_path.is_symlink() or not history_db_path.is_file():
+        raise MigrationError(
+            f"thread-history database is missing or unsafe: {history_db_path}"
+        )
+    validate_state_db_path(state_db_path)
+
+    history = sqlite3.connect(
+        sqlite_read_only_uri(history_db_path, immutable=immutable), uri=True
+    )
+    state = sqlite3.connect(
+        sqlite_read_only_uri(state_db_path, immutable=immutable), uri=True
+    )
+    try:
+        history.execute("BEGIN")
+        state.execute("BEGIN")
+        if history.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
+            raise MigrationError("thread-history SQLite integrity_check failed")
+        if history.execute("PRAGMA foreign_key_check").fetchall():
+            raise MigrationError("thread-history SQLite foreign_key_check failed")
+
+        table_names = [
+            row[0]
+            for row in history.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
+            )
+        ]
+        required_tables = {
+            "thread_history_projection_state",
+            "thread_items",
+            "thread_turns",
+        }
+        missing_tables = sorted(required_tables - set(table_names))
+        if missing_tables:
+            raise MigrationError(
+                "unsupported thread-history schema; missing tables: "
+                + ", ".join(missing_tables)
+            )
+
+        columns_by_table: dict[str, list[str]] = {}
+        for table in table_names:
+            columns_by_table[table] = [
+                row[1]
+                for row in history.execute(
+                    f"PRAGMA table_info({quoted_identifier(table)})"
+                )
+            ]
+        required_columns = {
+            "thread_history_projection_state": {
+                "thread_id",
+                "next_rollout_byte_offset",
+                "next_rollout_ordinal",
+            },
+            "thread_items": {"thread_id"},
+            "thread_turns": {
+                "thread_id",
+                "turn_id",
+                "rollout_ordinal",
+                "rollout_byte_offset",
+                "rollout_end_ordinal",
+                "rollout_end_byte_offset",
+            },
+        }
+        for table, expected in required_columns.items():
+            missing = sorted(expected - set(columns_by_table[table]))
+            if missing:
+                raise MigrationError(
+                    f"unsupported thread-history schema; {table} is missing: "
+                    + ", ".join(missing)
+                )
+
+        expected_offset_columns = {
+            ("thread_history_projection_state", "next_rollout_byte_offset"),
+            ("thread_turns", "rollout_byte_offset"),
+            ("thread_turns", "rollout_end_byte_offset"),
+        }
+        actual_offset_columns = {
+            (table, column)
+            for table, columns in columns_by_table.items()
+            for column in columns
+            if "byte_offset" in column.lower()
+        }
+        unexpected_offsets = sorted(actual_offset_columns - expected_offset_columns)
+        if unexpected_offsets:
+            rendered = ", ".join(
+                f"{table}.{column}" for table, column in unexpected_offsets
+            )
+            raise MigrationError(
+                "unsupported thread-history byte-offset columns: " + rendered
+            )
+
+        state_columns = {
+            row[1] for row in state.execute('PRAGMA table_info("threads")')
+        }
+        expected_state_columns = {"id", "rollout_path", "history_mode"}
+        if not expected_state_columns.issubset(state_columns):
+            raise MigrationError(
+                "state database lacks paginated thread path metadata"
+            )
+        state_threads = {
+            row[0]: (row[1], row[2])
+            for row in state.execute(
+                "SELECT id, rollout_path, history_mode FROM threads"
+            )
+        }
+        paginated_threads = sum(
+            history_mode == "paginated"
+            for _, history_mode in state_threads.values()
+        )
+
+        referenced_threads: set[str] = set()
+        for table in required_tables:
+            referenced_threads.update(
+                row[0]
+                for row in history.execute(
+                    f"SELECT DISTINCT thread_id FROM {quoted_identifier(table)}"
+                )
+            )
+        rollout_by_thread: dict[str, Path] = {}
+        for thread_id in referenced_threads:
+            if not isinstance(thread_id, str) or thread_id not in state_threads:
+                raise MigrationError(
+                    "thread-history database references an unknown state thread"
+                )
+            recorded_path, history_mode = state_threads[thread_id]
+            if history_mode != "paginated":
+                raise MigrationError(
+                    "thread-history database references a non-paginated state thread"
+                )
+            rollout = resolve_recorded_rollout_path(codex_home, recorded_path)
+            if not rollout_contains_paginated_thread(rollout, thread_id):
+                raise MigrationError(
+                    "paginated rollout metadata does not match its state thread"
+                )
+            rollout_by_thread[thread_id] = rollout
+
+        translation_cache: dict[
+            Path,
+            tuple[dict[int, int], dict[int, int], list[int], int],
+        ] = {}
+
+        def translate(
+            thread_id: str,
+            offset: Any,
+            ordinal: Any,
+            *,
+            end_offset: bool,
+            label: str,
+        ) -> int:
+            if type(offset) is not int or type(ordinal) is not int:
+                raise MigrationError(f"invalid thread-history offset pair: {label}")
+            rollout = rollout_by_thread.get(thread_id)
+            if rollout is None:
+                raise MigrationError(
+                    f"thread-history offset has no paginated rollout: {label}"
+                )
+            cached = translation_cache.get(rollout)
+            if cached is None:
+                data = rollout.read_bytes()
+                migrated_data, replacement_count = replace_provider_bytes(
+                    data,
+                    source_provider,
+                    target_provider,
+                )
+                match_positions = provider_match_positions(data, source_provider)
+                if replacement_count != len(match_positions):
+                    raise MigrationError(
+                        "thread-history provider replacement plan is inconsistent"
+                    )
+                cached = (
+                    rollout_line_boundaries(data),
+                    rollout_line_boundaries(migrated_data),
+                    match_positions,
+                    len(json_string_bytes(target_provider))
+                    - len(json_string_bytes(source_provider)),
+                )
+                translation_cache[rollout] = cached
+            (
+                boundaries,
+                migrated_boundaries,
+                match_positions,
+                replacement_delta,
+            ) = cached
+            expected_ordinal = boundaries.get(offset)
+            if expected_ordinal is None or expected_ordinal != ordinal + int(end_offset):
+                raise MigrationError(
+                    f"thread-history offset is not on its recorded JSONL boundary: {label}"
+                )
+            replacements_before = bisect.bisect_left(match_positions, offset)
+            migrated_offset = offset + replacements_before * replacement_delta
+            if migrated_boundaries.get(migrated_offset) != expected_ordinal:
+                raise MigrationError(
+                    f"migrated thread-history offset misses its JSONL boundary: {label}"
+                )
+            return migrated_offset
+
+        updates: list[HistoryOffsetUpdate] = []
+        for thread_id, offset, ordinal in history.execute(
+            "SELECT thread_id, next_rollout_byte_offset, next_rollout_ordinal "
+            "FROM thread_history_projection_state"
+        ):
+            migrated = translate(
+                thread_id,
+                offset,
+                ordinal,
+                end_offset=False,
+                label="thread_history_projection_state.next_rollout_byte_offset",
+            )
+            if migrated != offset:
+                updates.append(
+                    HistoryOffsetUpdate(
+                        table="thread_history_projection_state",
+                        key_columns=("thread_id",),
+                        key_values=(thread_id,),
+                        offset_column="next_rollout_byte_offset",
+                        original_offset=offset,
+                        migrated_offset=migrated,
+                    )
+                )
+
+        turn_rows = history.execute(
+            "SELECT thread_id, turn_id, rollout_ordinal, rollout_byte_offset, "
+            "rollout_end_ordinal, rollout_end_byte_offset FROM thread_turns"
+        )
+        for (
+            thread_id,
+            turn_id,
+            start_ordinal,
+            start_offset,
+            end_ordinal,
+            end_offset,
+        ) in turn_rows:
+            if not isinstance(thread_id, str) or not isinstance(turn_id, str):
+                raise MigrationError("invalid thread-history turn identity")
+            if start_offset is not None:
+                migrated = translate(
+                    thread_id,
+                    start_offset,
+                    start_ordinal,
+                    end_offset=False,
+                    label="thread_turns.rollout_byte_offset",
+                )
+                if migrated != start_offset:
+                    updates.append(
+                        HistoryOffsetUpdate(
+                            table="thread_turns",
+                            key_columns=("thread_id", "turn_id"),
+                            key_values=(thread_id, turn_id),
+                            offset_column="rollout_byte_offset",
+                            original_offset=start_offset,
+                            migrated_offset=migrated,
+                        )
+                    )
+            if (end_ordinal is None) != (end_offset is None):
+                raise MigrationError(
+                    "thread-history turn has an incomplete end offset pair"
+                )
+            if end_offset is not None:
+                migrated = translate(
+                    thread_id,
+                    end_offset,
+                    end_ordinal,
+                    end_offset=True,
+                    label="thread_turns.rollout_end_byte_offset",
+                )
+                if migrated != end_offset:
+                    updates.append(
+                        HistoryOffsetUpdate(
+                            table="thread_turns",
+                            key_columns=("thread_id", "turn_id"),
+                            key_values=(thread_id, turn_id),
+                            offset_column="rollout_end_byte_offset",
+                            original_offset=end_offset,
+                            migrated_offset=migrated,
+                        )
+                    )
+
+        rows = 0
+        for table in table_names:
+            rows += int(
+                history.execute(
+                    f"SELECT count(*) FROM {quoted_identifier(table)}"
+                ).fetchone()[0]
+            )
+        persistent_settings = read_persistent_sqlite_settings(history)
+        persistent_settings["journal_mode"] = sqlite_header_journal_mode(
+            history_db_path
+        )
+        updates.sort(
+            key=lambda update: (
+                update.table,
+                update.key_values,
+                update.offset_column,
+                update.original_offset,
+            )
+        )
+        analysis = HistoryDatabaseAnalysis(
+            present=True,
+            integrity_check="ok",
+            tables=len(table_names),
+            rows=rows,
+            paginated_threads=paginated_threads,
+            offset_fields_to_update=len(updates),
+            persistent_settings=persistent_settings,
+        )
+        return analysis, updates
+    finally:
+        state.close()
+        history.close()
+
+
+def analyze_history_database(
+    history_db_path: Path,
+    state_db_path: Path,
+    codex_home: Path,
+    source_provider: str,
+    target_provider: str,
+) -> HistoryDatabaseAnalysis:
+    analysis, _ = inspect_history_database(
+        history_db_path,
+        state_db_path,
+        codex_home,
+        source_provider,
+        target_provider,
+    )
+    return analysis
+
+
+def require_writable_database(db_path: Path, *, label: str = "state database") -> None:
     validate_state_db_path(db_path)
     connection = sqlite3.connect(db_path.resolve().as_uri() + "?mode=rw", uri=True)
     try:
@@ -507,7 +1000,62 @@ def require_writable_database(db_path: Path) -> None:
         connection.execute(f"PRAGMA user_version = {int(user_version)}")
         connection.rollback()
     except sqlite3.Error as exc:
-        raise MigrationError(f"state database is not writable: {db_path}") from exc
+        raise MigrationError(f"{label} is not writable: {db_path}") from exc
+    finally:
+        connection.close()
+
+
+def apply_history_offset_updates(
+    history_db_path: Path,
+    updates: list[HistoryOffsetUpdate],
+) -> int:
+    if not updates:
+        return 0
+    allowed_shapes = {
+        (
+            "thread_history_projection_state",
+            ("thread_id",),
+            "next_rollout_byte_offset",
+        ),
+        ("thread_turns", ("thread_id", "turn_id"), "rollout_byte_offset"),
+        ("thread_turns", ("thread_id", "turn_id"), "rollout_end_byte_offset"),
+    }
+    connection = sqlite3.connect(history_db_path)
+    try:
+        connection.execute("PRAGMA busy_timeout = 5000")
+        connection.execute("BEGIN IMMEDIATE")
+        changed = 0
+        for update in updates:
+            shape = (update.table, update.key_columns, update.offset_column)
+            if shape not in allowed_shapes:
+                connection.rollback()
+                raise MigrationError("invalid thread-history offset update plan")
+            where = " AND ".join(
+                f"{quoted_identifier(column)} = ?"
+                for column in update.key_columns
+            )
+            sql = (
+                f"UPDATE {quoted_identifier(update.table)} "
+                f"SET {quoted_identifier(update.offset_column)} = ? "
+                f"WHERE {where} "
+                f"AND {quoted_identifier(update.offset_column)} = ?"
+            )
+            result = connection.execute(
+                sql,
+                (
+                    update.migrated_offset,
+                    *update.key_values,
+                    update.original_offset,
+                ),
+            )
+            if result.rowcount != 1:
+                connection.rollback()
+                raise MigrationError(
+                    "thread-history offset changed after migration preflight"
+                )
+            changed += 1
+        connection.commit()
+        return changed
     finally:
         connection.close()
 
@@ -761,11 +1309,13 @@ def create_backup(
     codex_home: Path,
     sqlite_home: Path,
     db_path: Path,
+    history_db_path: Path,
     backup_dir: Path,
     source_provider: str,
     target_provider: str,
     rollout_analysis: RolloutAnalysis,
     database_analysis: DatabaseAnalysis,
+    history_database_analysis: HistoryDatabaseAnalysis,
     migrate_config: bool,
 ) -> dict[str, Any]:
     if backup_dir.exists():
@@ -802,6 +1352,21 @@ def create_backup(
     apply_file_metadata(database_backup, database_metadata)
     database_artifact = artifact_descriptor(database_backup, database_metadata)
 
+    history_database_artifact: dict[str, Any] = {"present": False}
+    if history_database_analysis.present:
+        history_database_metadata = capture_file_metadata(history_db_path)
+        history_database_backup = backup_dir / history_db_path.name
+        copy_database_backup(history_db_path, history_database_backup)
+        normalize_database_backup_settings(
+            history_database_backup,
+            history_database_analysis.persistent_settings,
+        )
+        apply_file_metadata(history_database_backup, history_database_metadata)
+        history_database_artifact = artifact_descriptor(
+            history_database_backup,
+            history_database_metadata,
+        )
+
     for relative, expected_hash in rollout_analysis.file_hashes.items():
         copied = backup_dir / relative
         expected_metadata = rollout_analysis.file_metadata[relative]
@@ -825,9 +1390,13 @@ def create_backup(
         "migrate_config": migrate_config,
         "rollout_analysis": dataclasses.asdict(rollout_analysis),
         "database_analysis": dataclasses.asdict(database_analysis),
+        "history_database_analysis": dataclasses.asdict(
+            history_database_analysis
+        ),
         "artifacts": {
             "config": config_artifact,
             "database": database_artifact,
+            "history_database": history_database_artifact,
         },
     }
     write_json_atomic(backup_dir / MANIFEST_NAME, manifest)
@@ -930,6 +1499,147 @@ def compare_sqlite_databases(
     return tables_checked, rows_checked, changed_rows
 
 
+def compare_history_databases(
+    original_path: Path,
+    migrated_path: Path,
+    state_db_path: Path,
+    rollout_root: Path,
+    source_provider: str,
+    target_provider: str,
+    *,
+    allow_restore_intermediate: bool = False,
+) -> tuple[int, int, int]:
+    analysis, updates = inspect_history_database(
+        original_path,
+        state_db_path,
+        rollout_root,
+        source_provider,
+        target_provider,
+        immutable=True,
+    )
+    if not analysis.present:
+        raise MigrationError("backup thread-history database is missing")
+
+    original = sqlite3.connect(
+        sqlite_read_only_uri(original_path, immutable=True), uri=True
+    )
+    migrated = sqlite3.connect(sqlite_read_only_uri(migrated_path), uri=True)
+    tables_checked = 0
+    rows_checked = 0
+    try:
+        original.execute("BEGIN")
+        migrated.execute("BEGIN")
+        if original.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
+            raise MigrationError("backup thread-history integrity_check failed")
+        if migrated.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
+            raise MigrationError("migrated thread-history integrity_check failed")
+        if original.execute("PRAGMA foreign_key_check").fetchall():
+            raise MigrationError("backup thread-history foreign_key_check failed")
+        if migrated.execute("PRAGMA foreign_key_check").fetchall():
+            raise MigrationError("migrated thread-history foreign_key_check failed")
+
+        original_settings = read_persistent_sqlite_settings(original)
+        migrated_settings = read_persistent_sqlite_settings(migrated)
+        for pragma in PERSISTENT_SQLITE_PRAGMAS:
+            if original_settings[pragma] == migrated_settings[pragma]:
+                continue
+            if (
+                allow_restore_intermediate
+                and pragma == "schema_version"
+                and type(original_settings[pragma]) is int
+                and migrated_settings[pragma] == original_settings[pragma] + 1
+            ):
+                continue
+            raise MigrationError(
+                f"thread-history persistent setting changed: {pragma}"
+            )
+        if sqlite_header_journal_mode(original_path) != sqlite_header_journal_mode(
+            migrated_path
+        ):
+            raise MigrationError(
+                "thread-history persistent setting changed: journal_mode"
+            )
+
+        schema_query = (
+            "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name"
+        )
+        if original.execute(schema_query).fetchall() != migrated.execute(
+            schema_query
+        ).fetchall():
+            raise MigrationError("thread-history SQLite schema changed")
+        tables = [
+            row[0]
+            for row in original.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+            )
+        ]
+        migrated_tables = [
+            row[0]
+            for row in migrated.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+            )
+        ]
+        if tables != migrated_tables:
+            raise MigrationError("thread-history SQLite table set changed")
+
+        planned = {
+            (
+                update.table,
+                update.key_values,
+                update.offset_column,
+                update.original_offset,
+            ): update.migrated_offset
+            for update in updates
+        }
+        for table in tables:
+            quoted = quoted_identifier(table)
+            columns = [
+                row[1] for row in original.execute(f"PRAGMA table_info({quoted})")
+            ]
+            original_rows = original.execute(f"SELECT * FROM {quoted}").fetchall()
+            migrated_rows = migrated.execute(f"SELECT * FROM {quoted}").fetchall()
+            expected_rows: list[tuple[Any, ...]] = []
+            if table == "thread_history_projection_state":
+                key_columns = ("thread_id",)
+                offset_columns = ("next_rollout_byte_offset",)
+            elif table == "thread_turns":
+                key_columns = ("thread_id", "turn_id")
+                offset_columns = (
+                    "rollout_byte_offset",
+                    "rollout_end_byte_offset",
+                )
+            else:
+                key_columns = ()
+                offset_columns = ()
+
+            for row in original_rows:
+                expected = list(row)
+                key_values = tuple(row[columns.index(key)] for key in key_columns)
+                for offset_column in offset_columns:
+                    index = columns.index(offset_column)
+                    locator = (
+                        table,
+                        key_values,
+                        offset_column,
+                        row[index],
+                    )
+                    if locator in planned:
+                        expected[index] = planned[locator]
+                expected_rows.append(tuple(expected))
+            if collections.Counter(expected_rows) != collections.Counter(
+                migrated_rows
+            ):
+                raise MigrationError(
+                    f"unexpected thread-history SQLite change in table {table}"
+                )
+            tables_checked += 1
+            rows_checked += len(original_rows)
+    finally:
+        original.close()
+        migrated.close()
+    return tables_checked, rows_checked, len(updates)
+
+
 def load_backup_manifest(backup_dir: Path) -> dict[str, Any]:
     manifest_path = backup_dir / MANIFEST_NAME
     try:
@@ -961,7 +1671,10 @@ def load_backup_manifest(backup_dir: Path) -> dict[str, Any]:
         raise MigrationError(
             "invalid backup manifest fields: " + ", ".join(invalid_strings)
         )
-    if manifest.get("manifest_version") != MANIFEST_VERSION:
+    if manifest.get("manifest_version") not in {
+        LEGACY_MANIFEST_VERSION,
+        MANIFEST_VERSION,
+    }:
         raise MigrationError("unsupported backup manifest version")
     if not isinstance(manifest.get("migrate_config"), bool):
         raise MigrationError("invalid backup manifest field: migrate_config")
@@ -977,6 +1690,18 @@ def load_backup_manifest(backup_dir: Path) -> dict[str, Any]:
             "backup manifest paths must be absolute: " + ", ".join(invalid_paths)
         )
     return manifest
+
+
+def history_database_descriptor(manifest: dict[str, Any]) -> dict[str, Any]:
+    if manifest.get("manifest_version") == LEGACY_MANIFEST_VERSION:
+        return {"present": False}
+    artifacts = manifest.get("artifacts")
+    if not isinstance(artifacts, dict):
+        raise MigrationError("invalid backup manifest artifacts")
+    descriptor = artifacts.get("history_database")
+    if not isinstance(descriptor, dict):
+        raise MigrationError("invalid backup manifest thread-history artifact")
+    return descriptor
 
 
 def validate_recorded_metadata(value: Any, label: str) -> dict[str, int]:
@@ -1039,7 +1764,10 @@ def validate_backup_artifacts(
             raise MigrationError(f"backup rollout metadata mismatch: {relative}")
 
     artifacts = manifest.get("artifacts")
-    if not isinstance(artifacts, dict) or set(artifacts) != {"config", "database"}:
+    expected_artifacts = {"config", "database"}
+    if manifest.get("manifest_version") == MANIFEST_VERSION:
+        expected_artifacts.add("history_database")
+    if not isinstance(artifacts, dict) or set(artifacts) != expected_artifacts:
         raise MigrationError("invalid backup manifest artifacts")
 
     config_descriptor = artifacts["config"]
@@ -1094,6 +1822,46 @@ def validate_backup_artifacts(
         if Path(f"{database_path}{suffix}").exists():
             raise MigrationError(f"unexpected SQLite sidecar in backup: {suffix}")
 
+    history_descriptor = history_database_descriptor(manifest)
+    if type(history_descriptor.get("present")) is not bool:
+        raise MigrationError("invalid backup manifest thread-history artifact")
+    history_path = backup_dir / HISTORY_DB_NAME
+    if history_descriptor["present"]:
+        if history_path.is_symlink() or not history_path.is_file():
+            raise MigrationError(
+                "backup thread-history database is missing or unsafe"
+            )
+        history_metadata = validate_recorded_metadata(
+            {
+                key: history_descriptor.get(key)
+                for key in ("mode", "uid", "gid", "mtime_ns")
+            },
+            HISTORY_DB_NAME,
+        )
+        history_hash = validate_sha256(
+            history_descriptor.get("sha256"), HISTORY_DB_NAME
+        )
+        if sha256_file(history_path) != history_hash:
+            raise MigrationError("backup thread-history database digest mismatch")
+        if capture_file_metadata(history_path) != history_metadata:
+            raise MigrationError("backup thread-history database metadata mismatch")
+        for suffix in ("-wal", "-shm", "-journal"):
+            if Path(f"{history_path}{suffix}").exists():
+                raise MigrationError(
+                    "unexpected thread-history SQLite sidecar in backup: " + suffix
+                )
+    elif history_path.exists() or history_path.is_symlink():
+        raise MigrationError("unexpected thread-history database exists in backup")
+
+    if manifest.get("manifest_version") == MANIFEST_VERSION:
+        history_analysis = manifest.get("history_database_analysis")
+        if (
+            not isinstance(history_analysis, dict)
+            or type(history_analysis.get("present")) is not bool
+            or history_analysis["present"] != history_descriptor["present"]
+        ):
+            raise MigrationError("invalid backup manifest thread-history analysis")
+
 
 def verify_against_backup(
     *,
@@ -1108,6 +1876,7 @@ def verify_against_backup(
     codex_home = (codex_home or Path(manifest["codex_home"])).resolve()
     sqlite_home = (sqlite_home or Path(manifest["sqlite_home"])).resolve()
     db_name = manifest["state_db_name"]
+    history_descriptor = history_database_descriptor(manifest)
 
     original_paths = rollout_paths(backup_dir)
     migrated_paths = rollout_paths(codex_home)
@@ -1124,7 +1893,11 @@ def verify_against_backup(
             f"rollout file set changed; missing={missing}, extra={extra}"
         )
 
-    backup_analysis = analyze_rollouts(backup_dir, source_provider)
+    backup_analysis = analyze_rollouts(
+        backup_dir,
+        source_provider,
+        allow_paginated=history_descriptor["present"],
+    )
     changed_files = 0
     unchanged_files = 0
     malformed_preserved = 0
@@ -1215,7 +1988,11 @@ def verify_against_backup(
                     f"unexpected logical rollout change: {relative}:{line_number}"
                 )
 
-    current_analysis = analyze_rollouts(codex_home, source_provider)
+    current_analysis = analyze_rollouts(
+        codex_home,
+        source_provider,
+        allow_paginated=history_descriptor["present"],
+    )
     if current_analysis.replacements:
         raise MigrationError("source-provider rollout metadata remains after migration")
     if session_meta_changed != backup_analysis.session_meta_values:
@@ -1273,6 +2050,34 @@ def verify_against_backup(
     for key in ("mode", "uid", "gid"):
         if current_database_metadata[key] != database_metadata[key]:
             raise MigrationError(f"SQLite {key} changed during migration")
+
+    history_tables = 0
+    history_rows = 0
+    history_offsets_changed = 0
+    history_path = sqlite_home / HISTORY_DB_NAME
+    if history_descriptor["present"]:
+        if history_path.is_symlink() or not history_path.is_file():
+            raise MigrationError("migrated thread-history database is missing")
+        history_tables, history_rows, history_offsets_changed = (
+            compare_history_databases(
+                backup_dir / HISTORY_DB_NAME,
+                history_path,
+                backup_dir / db_name,
+                backup_dir,
+                source_provider,
+                target_provider,
+            )
+        )
+        current_history_metadata = capture_file_metadata(history_path)
+        for key in ("mode", "uid", "gid"):
+            if current_history_metadata[key] != history_descriptor[key]:
+                raise MigrationError(
+                    f"thread-history SQLite {key} changed during migration"
+                )
+    elif history_path.exists() or history_path.is_symlink():
+        raise MigrationError(
+            "thread-history database appeared after the backup was created"
+        )
     return VerificationReport(
         rollout_files_checked=len(original_by_relative),
         changed_rollout_files=changed_files,
@@ -1284,6 +2089,9 @@ def verify_against_backup(
         sqlite_tables_checked=tables,
         sqlite_rows_checked=rows,
         sqlite_thread_rows_changed=changed_rows,
+        history_sqlite_tables_checked=history_tables,
+        history_sqlite_rows_checked=history_rows,
+        history_offset_fields_changed=history_offsets_changed,
         config_matches_expected=config_matches_expected,
     )
 
@@ -1412,6 +2220,55 @@ def verify_recoverable_state(
             raise MigrationError(
                 "live SQLite state is neither original nor migrated"
             ) from original_error
+
+    history_descriptor = history_database_descriptor(manifest)
+    history_path = sqlite_home / HISTORY_DB_NAME
+    if history_descriptor["present"]:
+        if history_path.is_symlink() or not history_path.is_file():
+            raise MigrationError("live thread-history database is missing or unsafe")
+        current_history_metadata = capture_file_metadata(history_path)
+        for key in ("uid", "gid"):
+            if current_history_metadata[key] != history_descriptor[key]:
+                raise MigrationError(
+                    f"live thread-history SQLite {key} is neither original nor migrated"
+                )
+        expected_history_mode = history_descriptor["mode"]
+        known_history_modes = {
+            expected_history_mode,
+            expected_history_mode & ~(stat.S_ISUID | stat.S_ISGID),
+        }
+        if current_history_metadata["mode"] not in known_history_modes:
+            raise MigrationError(
+                "live thread-history SQLite mode is neither original nor migrated"
+            )
+        try:
+            compare_history_databases(
+                backup_dir / HISTORY_DB_NAME,
+                history_path,
+                backup_dir / manifest["state_db_name"],
+                backup_dir,
+                source_provider,
+                target_provider,
+            )
+        except (MigrationError, sqlite3.Error):
+            try:
+                compare_history_databases(
+                    backup_dir / HISTORY_DB_NAME,
+                    history_path,
+                    backup_dir / manifest["state_db_name"],
+                    backup_dir,
+                    source_provider,
+                    source_provider,
+                    allow_restore_intermediate=True,
+                )
+            except (MigrationError, sqlite3.Error) as original_error:
+                raise MigrationError(
+                    "live thread-history state is neither original nor migrated"
+                ) from original_error
+    elif history_path.exists() or history_path.is_symlink():
+        raise MigrationError(
+            "live thread-history database is not recoverable from this backup"
+        )
 
 
 def restore_file_from_backup(source: Path, destination: Path) -> None:
@@ -1567,11 +2424,54 @@ def verify_restored_state(
         raise MigrationError("SQLite ownership differs after restoration")
     if backup_database_stat.st_mtime_ns != restored_database_stat.st_mtime_ns:
         raise MigrationError("SQLite mtime differs after restoration")
+
+    history_descriptor = history_database_descriptor(manifest)
+    history_database_restored = history_descriptor["present"]
+    history_tables = 0
+    history_rows = 0
+    history_path = sqlite_home / HISTORY_DB_NAME
+    if history_database_restored:
+        history_tables, history_rows, changed_offsets = compare_history_databases(
+            backup_dir / HISTORY_DB_NAME,
+            history_path,
+            backup_dir / db_name,
+            backup_dir,
+            source_provider,
+            source_provider,
+        )
+        if changed_offsets:
+            raise MigrationError(
+                "thread-history offsets differ after restoration"
+            )
+        backup_history_stat = (backup_dir / HISTORY_DB_NAME).stat()
+        restored_history_stat = history_path.stat()
+        if stat.S_IMODE(backup_history_stat.st_mode) != stat.S_IMODE(
+            restored_history_stat.st_mode
+        ):
+            raise MigrationError("thread-history SQLite mode differs after restoration")
+        if (backup_history_stat.st_uid, backup_history_stat.st_gid) != (
+            restored_history_stat.st_uid,
+            restored_history_stat.st_gid,
+        ):
+            raise MigrationError(
+                "thread-history SQLite ownership differs after restoration"
+            )
+        if backup_history_stat.st_mtime_ns != restored_history_stat.st_mtime_ns:
+            raise MigrationError(
+                "thread-history SQLite mtime differs after restoration"
+            )
+    elif history_path.exists() or history_path.is_symlink():
+        raise MigrationError(
+            "thread-history database should be absent after restoration"
+        )
     return RestorationReport(
         rollout_files_restored=len(backup_paths),
         config_restored=config_restored,
         sqlite_tables_checked=tables,
         sqlite_rows_checked=rows,
+        history_database_restored=history_database_restored,
+        history_sqlite_tables_checked=history_tables,
+        history_sqlite_rows_checked=history_rows,
     )
 
 
@@ -1616,6 +2516,21 @@ def restore_original_state(
             "refusing restoration because config.toml was absent from the backup"
         )
 
+    history_descriptor = history_database_descriptor(manifest)
+    history_path = sqlite_home / HISTORY_DB_NAME
+    history_expected = history_descriptor["present"]
+    if history_path.is_symlink() or (
+        history_path.exists() and not history_path.is_file()
+    ):
+        raise MigrationError(
+            f"refusing unsafe thread-history restore destination: {history_path}"
+        )
+    if not history_expected and history_path.exists():
+        raise MigrationError(
+            "refusing restoration because the thread-history database was absent "
+            "from the backup"
+        )
+
     db_name = manifest["state_db_name"]
     database_path = sqlite_home / db_name
     validate_state_db_path(database_path)
@@ -1637,6 +2552,29 @@ def restore_original_state(
     except (MigrationError, sqlite3.Error):
         pass
 
+    history_is_original = not history_expected
+    if history_expected:
+        try:
+            _, _, changed_offsets = compare_history_databases(
+                backup_dir / HISTORY_DB_NAME,
+                history_path,
+                backup_dir / db_name,
+                backup_dir,
+                manifest["source_provider"],
+                manifest["source_provider"],
+            )
+            expected_history_metadata = {
+                key: history_descriptor[key]
+                for key in ("mode", "uid", "gid", "mtime_ns")
+            }
+            history_is_original = (
+                changed_offsets == 0
+                and capture_file_metadata(history_path)
+                == expected_history_metadata
+            )
+        except (MigrationError, sqlite3.Error):
+            history_is_original = False
+
     for relative, source in backup_paths.items():
         restore_file_from_backup(source, current_paths[relative])
 
@@ -1648,6 +2586,11 @@ def restore_original_state(
         restore_database_from_backup(
             backup_dir / db_name,
             database_path,
+        )
+    if history_expected and not history_is_original:
+        restore_database_from_backup(
+            backup_dir / HISTORY_DB_NAME,
+            history_path,
         )
     return verify_restored_state(
         backup_dir=backup_dir,
@@ -1771,9 +2714,26 @@ def apply_migration(
 
     ensure_supported_storage(codex_home, sqlite_home)
     db_path = sqlite_home / STATE_DB_NAME
+    history_db_path = sqlite_home / HISTORY_DB_NAME
     require_writable_database(db_path)
-    rollout_analysis = analyze_rollouts(codex_home, source_provider)
+    rollout_analysis = analyze_rollouts(
+        codex_home,
+        source_provider,
+        allow_paginated=history_db_path.is_file(),
+    )
     database_analysis = analyze_database(db_path, source_provider)
+    history_database_analysis, history_offset_updates = inspect_history_database(
+        history_db_path,
+        db_path,
+        codex_home,
+        source_provider,
+        target_provider,
+    )
+    if history_database_analysis.present:
+        require_writable_database(
+            history_db_path,
+            label="thread-history database",
+        )
     config_path = codex_home / "config.toml"
     config_before = config_path.read_bytes() if config_path.is_file() else None
     config_after = None
@@ -1788,15 +2748,21 @@ def apply_migration(
         codex_home=codex_home,
         sqlite_home=sqlite_home,
         db_path=db_path,
+        history_db_path=history_db_path,
         backup_dir=backup_dir,
         source_provider=source_provider,
         target_provider=target_provider,
         rollout_analysis=rollout_analysis,
         database_analysis=database_analysis,
+        history_database_analysis=history_database_analysis,
         migrate_config=migrate_config,
     )
 
-    current_analysis = analyze_rollouts(codex_home, source_provider)
+    current_analysis = analyze_rollouts(
+        codex_home,
+        source_provider,
+        allow_paginated=history_database_analysis.present,
+    )
     if (
         current_analysis.file_hashes != rollout_analysis.file_hashes
         or current_analysis.file_metadata != rollout_analysis.file_metadata
@@ -1837,6 +2803,37 @@ def apply_migration(
         raise MigrationError(
             "SQLite metadata changed after backup; no migration was applied"
         )
+    current_history_analysis, current_history_updates = inspect_history_database(
+        history_db_path,
+        db_path,
+        codex_home,
+        source_provider,
+        target_provider,
+    )
+    if (
+        current_history_analysis != history_database_analysis
+        or current_history_updates != history_offset_updates
+    ):
+        raise MigrationError(
+            "thread-history state changed after backup; no migration was applied"
+        )
+    if history_database_analysis.present:
+        compare_history_databases(
+            backup_dir / HISTORY_DB_NAME,
+            history_db_path,
+            backup_dir / db_path.name,
+            backup_dir,
+            source_provider,
+            source_provider,
+        )
+        if capture_file_metadata(history_db_path) != {
+            key: manifest["artifacts"]["history_database"][key]
+            for key in ("mode", "uid", "gid", "mtime_ns")
+        }:
+            raise MigrationError(
+                "thread-history SQLite metadata changed after backup; "
+                "no migration was applied"
+            )
 
     # Roll back on ordinary failures and operator interruption alike. Once the
     # first atomic replacement starts, returning without attempting recovery
@@ -1882,6 +2879,24 @@ def apply_migration(
         finally:
             connection.close()
         os.chmod(db_path, manifest["artifacts"]["database"]["mode"])
+
+        history_offsets_changed = 0
+        if history_database_analysis.present:
+            history_offsets_changed = apply_history_offset_updates(
+                history_db_path,
+                history_offset_updates,
+            )
+            if (
+                history_offsets_changed
+                != history_database_analysis.offset_fields_to_update
+            ):
+                raise MigrationError(
+                    "thread-history offset update count does not match preflight"
+                )
+            os.chmod(
+                history_db_path,
+                manifest["artifacts"]["history_database"]["mode"],
+            )
 
         if config_after is not None:
             atomic_write(config_path, config_after, preserve_mtime=False)
@@ -2007,6 +3022,7 @@ def main(argv: list[str] | None = None) -> int:
             raise MigrationError(f"Codex home does not exist: {codex_home}")
         ensure_supported_storage(codex_home, sqlite_home)
         db_path = sqlite_home / STATE_DB_NAME
+        history_db_path = sqlite_home / HISTORY_DB_NAME
 
         if args.apply:
             if args.backup_dir is None:
@@ -2030,8 +3046,19 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 0
 
-        rollout = analyze_rollouts(codex_home, args.from_provider)
+        rollout = analyze_rollouts(
+            codex_home,
+            args.from_provider,
+            allow_paginated=history_db_path.is_file(),
+        )
         database = analyze_database(db_path, args.from_provider)
+        history_database = analyze_history_database(
+            history_db_path,
+            db_path,
+            codex_home,
+            args.from_provider,
+            args.to_provider,
+        )
         config_status = "not requested"
         if args.migrate_config:
             config_path = codex_home / "config.toml"
@@ -2056,6 +3083,10 @@ def main(argv: list[str] | None = None) -> int:
                     if key not in {"file_hashes", "file_metadata"}
                 },
                 **dataclasses.asdict(database),
+                **{
+                    f"history_{key}": value
+                    for key, value in dataclasses.asdict(history_database).items()
+                },
             },
             args.json,
         )

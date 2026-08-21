@@ -1,6 +1,6 @@
 # Codex model-provider migration
 
-This standalone, standard-library-only Python utility relabels legacy Codex CLI
+This standalone, standard-library-only Python utility relabels Codex CLI
 sessions from a custom provider ID (for example, `proxy`) to the built-in
 `openai` provider. It preserves existing thread UUIDs and SQLite-only metadata
 such as names and pins.
@@ -18,11 +18,14 @@ verifies the original state from the backup before returning the error.
 
 ## Compatibility and supported scope
 
-The utility was developed and tested against the legacy rollout format and
-`state_5.sqlite` used by Codex CLI 0.146.0. It supports:
+The utility was developed against the legacy rollout format in Codex CLI
+0.146.0 and the paginated format in Codex CLI 0.149.0. It supports:
 
 - plain JSONL rollouts in `sessions` and `archived_sessions`;
 - `state_5.sqlite` as the metadata database;
+- mixed legacy and paginated rollouts;
+- the `thread_history_1.sqlite` projection schema used by Codex CLI 0.149.0,
+  including its rollout byte offsets;
 - provider metadata at these two rollout paths only:
   - `session_meta.payload.model_provider`;
   - `event_msg.payload.thread_settings.model_provider_id` when the event type is
@@ -31,17 +34,21 @@ The utility was developed and tested against the legacy rollout format and
 It deliberately refuses to write if it finds:
 
 - compressed rollouts;
-- paginated history or a `history_base` reference;
-- `thread_history_1.sqlite`;
+- a `history_base` reference;
+- paginated history without its thread-history database;
+- an unknown thread-history schema, an unrecognized byte-offset column, or an
+  offset/ordinal pair that is not on the recorded JSONL boundary;
 - provider values at an unknown JSON path;
 - a provider-looking match inside malformed JSON;
 - a custom provider configuration that cannot be represented safely by
   `openai_base_url`.
 
-These refusals matter because newer paginated histories can store byte offsets
-into rollout files. A length-changing replacement could invalidate those
-offsets. A refusal means the detected format has not been proven safe; do not
-work around it by manually replacing text.
+For a supported paginated history, the utility validates every stored byte
+offset against the original JSONL line boundary and shifts it by the exact
+cumulative replacement delta before that boundary. It then verifies the entire
+thread-history database against the backup, allowing changes only to those
+calculated offset fields. A refusal means the detected format has not been
+proven safe; do not work around it by manually replacing text.
 
 ## What changes
 
@@ -49,7 +56,9 @@ For the requested source and target providers, `migrate.py` changes only:
 
 1. The two validated provider fields in active and archived rollout JSONL.
 2. `threads.model_provider` in `state_5.sqlite`.
-3. With `--migrate-config`, the active `config.toml`:
+3. For paginated threads, the three recognized rollout byte-offset columns in
+   `thread_history_1.sqlite` when their values need to shift.
+4. With `--migrate-config`, the active `config.toml`:
    - removes the root custom-provider selector;
    - removes that provider's table;
    - copies its exact `base_url` value to root `openai_base_url`.
@@ -64,15 +73,16 @@ table. Comments and values outside the removed selector and table are retained;
 the semantic verifier rejects changes to unrelated TOML values.
 
 The utility does not alter `history.jsonl`, `auth.json`, model caches, logs,
-goals, memories, other SQLite databases, message text, thread IDs, rollout
-timestamps, file modes, or ownership. Rewriting `config.toml` normally updates
-that file's modification time, as any intentional config edit would.
+goals, memories, other SQLite databases, thread-history items or turn data,
+message text, thread IDs, rollout ordinals, rollout timestamps, file modes, or
+ownership. Rewriting `config.toml` normally updates that file's modification
+time, as any intentional config edit would.
 
 ## Requirements
 
 - Python 3.11 or newer (for `tomllib`).
-- Enough free space for a complete copy of the session directories and a
-  consistent SQLite backup.
+- Enough free space for a complete copy of the session directories and
+  consistent backups of both SQLite databases when paginated history exists.
 - A writable SQLite state directory. Opening a database whose persistent
   journal mode is WAL can make SQLite create standard empty `-wal` and `-shm`
   coordination files even though the connection is read-only.
@@ -240,7 +250,8 @@ The backup contains:
 
 - the original active and archived rollout trees;
 - the original `config.toml`, when present;
-- a consistent SQLite backup created through SQLite's backup API;
+- consistent backups of `state_5.sqlite` and, when present,
+  `thread_history_1.sqlite`, created through SQLite's backup API;
 - `migration-manifest.json`, including artifact digests and metadata,
   preflight counts, recovery status, and the final verification report.
 
@@ -256,8 +267,9 @@ python3 verify.py --backup-dir "$migration_backup_dir"
 
 The verifier compares every rollout byte-for-byte against the exact expected
 replacement, checks every JSONL record, preserves malformed lines verbatim,
-compares all SQLite tables and rows, verifies the schema and integrity, and
-checks the exact expected config transformation.
+compares every table and row in both SQLite databases, verifies their schemas
+and integrity, validates the exact paginated-offset shifts, and checks the
+expected config transformation.
 
 By default, the verifier reads the original state paths recorded in the private
 backup manifest. Use `--codex-home` or `--sqlite-home` to verify state restored
@@ -281,10 +293,10 @@ effective default provider ID, `openai`.
 ## Failure and recovery
 
 If apply fails after writes begin, it automatically restores every rollout,
-`config.toml`, and the SQLite database from the backup and verifies the restored
-state. SQLite restoration uses its transactional backup API so committed WAL
-state is replaced consistently. The manifest status becomes `rolled_back` when
-that succeeds.
+`config.toml`, and both SQLite databases from the backup and verifies the
+restored state. SQLite restoration uses its transactional backup API so
+committed WAL state is replaced consistently. The manifest status becomes
+`rolled_back` when that succeeds.
 
 If you want to undo a completed migration, keep Codex stopped and run:
 
@@ -346,11 +358,12 @@ python3 -B -m unittest discover -s tests -v
 
 The tests cover dry-run record immutability, exact byte changes, malformed-line
 preservation, special file modes and timestamps, SQLite-only change
-enforcement, config conversion, independent re-verification, and refusal of
-unknown or paginated formats. They also cover backup tampering, newer live
-activity, config presence changes, WAL sidecars, automatic rollback, and
-resuming an interrupted restore. Test data uses reserved example domains and
-temporary directories; it does not require real Codex state.
+enforcement, config conversion, paginated offset migration and restoration,
+independent re-verification, and refusal of unknown history schemas or
+misaligned offsets. They also cover backup tampering, newer live activity,
+config presence changes, WAL sidecars, automatic rollback, and resuming an
+interrupted restore. Test data uses reserved example domains and temporary
+directories; it does not require real Codex state.
 
 ## Project status
 

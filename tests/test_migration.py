@@ -141,7 +141,9 @@ trust_level = "trusted"
                 CREATE TABLE threads (
                     id TEXT PRIMARY KEY,
                     model_provider TEXT NOT NULL,
-                    title TEXT NOT NULL
+                    title TEXT NOT NULL,
+                    rollout_path TEXT NOT NULL,
+                    history_mode TEXT NOT NULL DEFAULT 'legacy'
                 );
                 CREATE INDEX idx_threads_provider ON threads(model_provider);
                 CREATE TABLE unrelated (
@@ -151,10 +153,24 @@ trust_level = "trusted"
                 """
             )
             connection.executemany(
-                "INSERT INTO threads(id, model_provider, title) VALUES (?, ?, ?)",
+                "INSERT INTO threads("
+                "id, model_provider, title, rollout_path, history_mode"
+                ") VALUES (?, ?, ?, ?, ?)",
                 [
-                    ("proxy-thread", "proxy", "Proxy thread"),
-                    ("openai-thread", "openai", "OpenAI thread"),
+                    (
+                        "proxy-thread",
+                        "proxy",
+                        "Proxy thread",
+                        str(self.proxy_rollout),
+                        "legacy",
+                    ),
+                    (
+                        "openai-thread",
+                        "openai",
+                        "OpenAI thread",
+                        str(self.openai_rollout),
+                        "legacy",
+                    ),
                 ],
             )
             connection.execute(
@@ -163,6 +179,127 @@ trust_level = "trusted"
             connection.commit()
         finally:
             connection.close()
+
+    def enable_paginated_history(self) -> dict[str, int]:
+        lines = self.proxy_rollout.read_bytes().splitlines(keepends=True)
+        first = json.loads(lines[0])
+        first["payload"]["history_mode"] = "paginated"
+        first["payload"]["history_base"] = None
+        lines[0] = self._line(first)
+        rollout = b"".join(lines)
+        self.proxy_rollout.write_bytes(rollout)
+
+        state = sqlite3.connect(self.codex_home / migrate.STATE_DB_NAME)
+        try:
+            relocated_path = Path("/relocated/codex-home") / self.proxy_rollout.relative_to(
+                self.codex_home
+            )
+            state.execute(
+                "UPDATE threads SET rollout_path = ?, history_mode = 'paginated' "
+                "WHERE id = 'proxy-thread'",
+                (str(relocated_path),),
+            )
+            state.commit()
+        finally:
+            state.close()
+
+        first_boundary = len(lines[0])
+        second_boundary = first_boundary + len(lines[1])
+        offsets = {
+            "turn_start": first_boundary,
+            "turn_end": second_boundary,
+            "projection": len(rollout),
+            "projection_ordinal": len(lines),
+        }
+        history_path = self.sqlite_home / migrate.HISTORY_DB_NAME
+        history = sqlite3.connect(history_path)
+        try:
+            history.execute("PRAGMA journal_mode = WAL").fetchone()
+            history.executescript(
+                """
+                CREATE TABLE thread_history_projection_state (
+                    thread_id TEXT PRIMARY KEY,
+                    next_rollout_byte_offset INTEGER NOT NULL,
+                    next_rollout_ordinal INTEGER NOT NULL
+                );
+                CREATE TABLE thread_items (
+                    thread_id TEXT NOT NULL,
+                    turn_id TEXT NOT NULL,
+                    item_id TEXT NOT NULL,
+                    rollout_ordinal INTEGER NOT NULL,
+                    created_at_ms INTEGER NOT NULL,
+                    item_json TEXT NOT NULL,
+                    item_type TEXT NOT NULL DEFAULT '',
+                    updated_at_ordinal INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (thread_id, turn_id, item_id)
+                );
+                CREATE TABLE thread_turns (
+                    thread_id TEXT NOT NULL,
+                    turn_id TEXT NOT NULL,
+                    rollout_ordinal INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    error_json TEXT,
+                    started_at INTEGER,
+                    completed_at INTEGER,
+                    duration_ms INTEGER,
+                    first_user_item_id TEXT,
+                    final_agent_item_id TEXT,
+                    rollout_byte_offset INTEGER,
+                    rollout_end_ordinal INTEGER,
+                    rollout_end_byte_offset INTEGER,
+                    PRIMARY KEY (thread_id, turn_id)
+                );
+                """
+            )
+            history.execute(
+                "INSERT INTO thread_history_projection_state VALUES (?, ?, ?)",
+                (
+                    "proxy-thread",
+                    offsets["projection"],
+                    offsets["projection_ordinal"],
+                ),
+            )
+            history.execute(
+                "INSERT INTO thread_turns("
+                "thread_id, turn_id, rollout_ordinal, status, "
+                "rollout_byte_offset, rollout_end_ordinal, rollout_end_byte_offset"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "proxy-thread",
+                    "turn-1",
+                    1,
+                    "completed",
+                    offsets["turn_start"],
+                    1,
+                    offsets["turn_end"],
+                ),
+            )
+            history.execute(
+                "INSERT INTO thread_items("
+                "thread_id, turn_id, item_id, rollout_ordinal, created_at_ms, "
+                "item_json, item_type"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "proxy-thread",
+                    "turn-1",
+                    "item-1",
+                    1,
+                    1,
+                    json.dumps(
+                        {
+                            "type": "userMessage",
+                            "text": 'literal text: "model_provider":"proxy"',
+                        }
+                    ),
+                    "userMessage",
+                ),
+            )
+            history.commit()
+        finally:
+            history.close()
+        os.chmod(history_path, 0o640)
+        os.utime(history_path, ns=(1_700_000_002_000_000_000,) * 2)
+        return offsets
 
 
 class ProviderMigrationTests(unittest.TestCase):
@@ -422,11 +559,175 @@ class ProviderMigrationTests(unittest.TestCase):
                 self.fixture.codex_home, self.fixture.sqlite_home
             )
 
-    def test_refuses_thread_history_database(self) -> None:
-        (self.fixture.sqlite_home / "thread_history_1.sqlite").write_bytes(b"")
-        with self.assertRaisesRegex(migrate.MigrationError, "thread-history"):
-            migrate.ensure_supported_storage(
-                self.fixture.codex_home, self.fixture.sqlite_home
+    def test_refuses_invalid_thread_history_database(self) -> None:
+        (self.fixture.sqlite_home / migrate.HISTORY_DB_NAME).write_bytes(b"")
+        with self.assertRaisesRegex(
+            (migrate.MigrationError, sqlite3.DatabaseError),
+            "thread-history|database",
+        ):
+            migrate.analyze_history_database(
+                self.fixture.sqlite_home / migrate.HISTORY_DB_NAME,
+                self.fixture.sqlite_home / migrate.STATE_DB_NAME,
+                self.fixture.codex_home,
+                "proxy",
+                "openai",
+            )
+
+    def test_paginated_history_offsets_are_migrated_verified_and_restored(
+        self,
+    ) -> None:
+        offsets = self.fixture.enable_paginated_history()
+        history_path = self.fixture.sqlite_home / migrate.HISTORY_DB_NAME
+        history_metadata = migrate.capture_file_metadata(history_path)
+        history = sqlite3.connect(history_path)
+        try:
+            item_json_before = history.execute(
+                "SELECT item_json FROM thread_items WHERE item_id = 'item-1'"
+            ).fetchone()[0]
+        finally:
+            history.close()
+
+        analysis = migrate.analyze_history_database(
+            history_path,
+            self.fixture.sqlite_home / migrate.STATE_DB_NAME,
+            self.fixture.codex_home,
+            "proxy",
+            "openai",
+        )
+        self.assertTrue(analysis.present)
+        self.assertEqual(analysis.paginated_threads, 1)
+        self.assertEqual(analysis.offset_fields_to_update, 3)
+
+        with mock.patch.object(
+            migrate, "find_processes_with_open_state", return_value=[]
+        ):
+            report = migrate.apply_migration(
+                codex_home=self.fixture.codex_home,
+                sqlite_home=self.fixture.sqlite_home,
+                backup_dir=self.fixture.backup_dir,
+                source_provider="proxy",
+                target_provider="openai",
+                migrate_config=True,
+                confirm_stopped=True,
+            )
+
+        self.assertEqual(report.history_sqlite_tables_checked, 3)
+        self.assertEqual(report.history_sqlite_rows_checked, 3)
+        self.assertEqual(report.history_offset_fields_changed, 3)
+        history = sqlite3.connect(history_path)
+        try:
+            self.assertEqual(
+                history.execute(
+                    "SELECT next_rollout_byte_offset "
+                    "FROM thread_history_projection_state"
+                ).fetchone(),
+                (offsets["projection"] + 3,),
+            )
+            self.assertEqual(
+                history.execute(
+                    "SELECT rollout_byte_offset, rollout_end_byte_offset "
+                    "FROM thread_turns"
+                ).fetchone(),
+                (offsets["turn_start"] + 1, offsets["turn_end"] + 2),
+            )
+            self.assertEqual(
+                history.execute(
+                    "SELECT item_json FROM thread_items WHERE item_id = 'item-1'"
+                ).fetchone()[0],
+                item_json_before,
+            )
+        finally:
+            history.close()
+
+        self.assertEqual(
+            migrate.verify_against_backup(
+                backup_dir=self.fixture.backup_dir,
+                codex_home=self.fixture.codex_home,
+                sqlite_home=self.fixture.sqlite_home,
+            ),
+            report,
+        )
+        manifest = migrate.load_backup_manifest(self.fixture.backup_dir)
+        self.assertTrue(manifest["artifacts"]["history_database"]["present"])
+        for database_name in (migrate.STATE_DB_NAME, migrate.HISTORY_DB_NAME):
+            for suffix in ("-wal", "-shm", "-journal"):
+                self.assertFalse(
+                    Path(f"{self.fixture.backup_dir / database_name}{suffix}").exists()
+                )
+
+        with mock.patch.object(
+            migrate, "find_processes_with_open_state", return_value=[]
+        ):
+            restoration = migrate.restore_from_backup(
+                backup_dir=self.fixture.backup_dir,
+                codex_home=self.fixture.codex_home,
+                sqlite_home=self.fixture.sqlite_home,
+                confirm_stopped=True,
+            )
+        self.assertTrue(restoration.history_database_restored)
+        self.assertEqual(restoration.history_sqlite_tables_checked, 3)
+        self.assertEqual(restoration.history_sqlite_rows_checked, 3)
+        self.assertEqual(migrate.capture_file_metadata(history_path), history_metadata)
+        history = sqlite3.connect(history_path)
+        try:
+            self.assertEqual(
+                history.execute(
+                    "SELECT next_rollout_byte_offset "
+                    "FROM thread_history_projection_state"
+                ).fetchone(),
+                (offsets["projection"],),
+            )
+            self.assertEqual(
+                history.execute(
+                    "SELECT rollout_byte_offset, rollout_end_byte_offset "
+                    "FROM thread_turns"
+                ).fetchone(),
+                (offsets["turn_start"], offsets["turn_end"]),
+            )
+        finally:
+            history.close()
+
+    def test_paginated_history_refuses_unknown_byte_offset_columns(self) -> None:
+        self.fixture.enable_paginated_history()
+        history_path = self.fixture.sqlite_home / migrate.HISTORY_DB_NAME
+        history = sqlite3.connect(history_path)
+        try:
+            history.execute(
+                "ALTER TABLE thread_items ADD COLUMN future_byte_offset INTEGER"
+            )
+            history.commit()
+        finally:
+            history.close()
+        with self.assertRaisesRegex(
+            migrate.MigrationError, "unsupported thread-history byte-offset"
+        ):
+            migrate.analyze_history_database(
+                history_path,
+                self.fixture.sqlite_home / migrate.STATE_DB_NAME,
+                self.fixture.codex_home,
+                "proxy",
+                "openai",
+            )
+
+    def test_paginated_history_refuses_misaligned_offset_ordinal(self) -> None:
+        self.fixture.enable_paginated_history()
+        history_path = self.fixture.sqlite_home / migrate.HISTORY_DB_NAME
+        history = sqlite3.connect(history_path)
+        try:
+            history.execute(
+                "UPDATE thread_history_projection_state "
+                "SET next_rollout_ordinal = next_rollout_ordinal + 1"
+            )
+            history.commit()
+        finally:
+            history.close()
+        with self.assertRaisesRegex(migrate.MigrationError, "JSONL boundary"):
+            migrate.analyze_history_database(
+                history_path,
+                self.fixture.sqlite_home / migrate.STATE_DB_NAME,
+                self.fixture.codex_home,
+                "proxy",
+                "openai",
             )
 
     def test_refuses_unknown_provider_metadata_path(self) -> None:
@@ -712,6 +1013,34 @@ class ProviderMigrationTests(unittest.TestCase):
         self.assertEqual(result["result"], "dry run; no Codex records changed")
         self.assertEqual(result["rows_from_provider"], 1)
 
+    def test_cli_json_dry_run_reports_paginated_history_without_changes(self) -> None:
+        self.fixture.enable_paginated_history()
+        history_path = self.fixture.sqlite_home / migrate.HISTORY_DB_NAME
+        rollout_before = self.fixture.proxy_rollout.read_bytes()
+        history_before = history_path.read_bytes()
+        output = io.StringIO()
+        with redirect_stdout(output):
+            status = migrate.main(
+                [
+                    "--codex-home",
+                    str(self.fixture.codex_home),
+                    "--sqlite-home",
+                    str(self.fixture.sqlite_home),
+                    "--from-provider",
+                    "proxy",
+                    "--to-provider",
+                    "openai",
+                    "--json",
+                ]
+            )
+        self.assertEqual(status, 0)
+        result = json.loads(output.getvalue())
+        self.assertTrue(result["history_present"])
+        self.assertEqual(result["history_paginated_threads"], 1)
+        self.assertEqual(result["history_offset_fields_to_update"], 3)
+        self.assertEqual(self.fixture.proxy_rollout.read_bytes(), rollout_before)
+        self.assertEqual(history_path.read_bytes(), history_before)
+
     def test_failed_final_verification_rolls_back_wal_state(self) -> None:
         rollout_before = self.fixture.proxy_rollout.read_bytes()
         config_path = self.fixture.codex_home / "config.toml"
@@ -801,6 +1130,48 @@ class ProviderMigrationTests(unittest.TestCase):
             connection.close()
         manifest = migrate.load_backup_manifest(self.fixture.backup_dir)
         self.assertEqual(manifest["status"], "restored")
+
+    def test_version_two_legacy_backup_remains_verifiable_and_restorable(
+        self,
+    ) -> None:
+        with mock.patch.object(
+            migrate, "find_processes_with_open_state", return_value=[]
+        ):
+            migrate.apply_migration(
+                codex_home=self.fixture.codex_home,
+                sqlite_home=self.fixture.sqlite_home,
+                backup_dir=self.fixture.backup_dir,
+                source_provider="proxy",
+                target_provider="openai",
+                migrate_config=True,
+                confirm_stopped=True,
+            )
+
+        manifest = migrate.load_backup_manifest(self.fixture.backup_dir)
+        manifest["manifest_version"] = migrate.LEGACY_MANIFEST_VERSION
+        manifest.pop("history_database_analysis")
+        manifest["artifacts"].pop("history_database")
+        migrate.write_json_atomic(
+            self.fixture.backup_dir / migrate.MANIFEST_NAME,
+            manifest,
+        )
+        verification = migrate.verify_against_backup(
+            backup_dir=self.fixture.backup_dir,
+            codex_home=self.fixture.codex_home,
+            sqlite_home=self.fixture.sqlite_home,
+        )
+        self.assertEqual(verification.history_sqlite_tables_checked, 0)
+
+        with mock.patch.object(
+            migrate, "find_processes_with_open_state", return_value=[]
+        ):
+            restoration = migrate.restore_from_backup(
+                backup_dir=self.fixture.backup_dir,
+                codex_home=self.fixture.codex_home,
+                sqlite_home=self.fixture.sqlite_home,
+                confirm_stopped=True,
+            )
+        self.assertFalse(restoration.history_database_restored)
 
     def test_interrupted_restore_is_safely_resumable(self) -> None:
         real_restore_file = migrate.restore_file_from_backup
