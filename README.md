@@ -26,6 +26,7 @@ The utility was developed against the legacy rollout format in Codex CLI
 - mixed legacy and paginated rollouts;
 - the `thread_history_1.sqlite` projection schema used by Codex CLI 0.149.0,
   including its rollout byte offsets;
+- paginated `history_base` references, including chained source histories;
 - provider metadata at these two rollout paths only:
   - `session_meta.payload.model_provider`;
   - `event_msg.payload.thread_settings.model_provider_id` when the event type is
@@ -34,8 +35,9 @@ The utility was developed against the legacy rollout format in Codex CLI
 It deliberately refuses to write if it finds:
 
 - compressed rollouts;
-- a `history_base` reference;
 - paginated history without its thread-history database;
+- an unknown `history_base` schema, missing source thread, reference cycle, or
+  cutoff that is not on the recorded source JSONL boundary;
 - an unknown thread-history schema, an unrecognized byte-offset column, or an
   offset/ordinal pair that is not on the recorded JSONL boundary;
 - provider values at an unknown JSON path;
@@ -45,10 +47,12 @@ It deliberately refuses to write if it finds:
 
 For a supported paginated history, the utility validates every stored byte
 offset against the original JSONL line boundary and shifts it by the exact
-cumulative replacement delta before that boundary. It then verifies the entire
-thread-history database against the backup, allowing changes only to those
-calculated offset fields. A refusal means the detected format has not been
-proven safe; do not work around it by manually replacing text.
+cumulative replacement delta before that boundary. For `history_base`, it
+resolves the source-thread dependency first, preserves the referenced ordinal,
+and rewrites the embedded source byte offset. It then verifies every rollout
+and the entire thread-history database against the backup, allowing changes
+only to those calculated fields. A refusal means the detected format has not
+been proven safe; do not work around it by manually replacing text.
 
 ## What changes
 
@@ -56,9 +60,11 @@ For the requested source and target providers, `migrate.py` changes only:
 
 1. The two validated provider fields in active and archived rollout JSONL.
 2. `threads.model_provider` in `state_5.sqlite`.
-3. For paginated threads, the three recognized rollout byte-offset columns in
+3. For paginated child histories, `history_base.end_byte_offset` when its source
+   rollout changes length.
+4. For paginated threads, the three recognized rollout byte-offset columns in
    `thread_history_1.sqlite` when their values need to shift.
-4. With `--migrate-config`, the active `config.toml`:
+5. With `--migrate-config`, the active `config.toml`:
    - removes the root custom-provider selector;
    - removes that provider's table;
    - copies its exact `base_url` value to root `openai_base_url`.
@@ -359,11 +365,12 @@ python3 -B -m unittest discover -s tests -v
 The tests cover dry-run record immutability, exact byte changes, malformed-line
 preservation, special file modes and timestamps, SQLite-only change
 enforcement, config conversion, paginated offset migration and restoration,
-independent re-verification, and refusal of unknown history schemas or
-misaligned offsets. They also cover backup tampering, newer live activity,
-config presence changes, WAL sidecars, automatic rollback, and resuming an
-interrupted restore. Test data uses reserved example domains and temporary
-directories; it does not require real Codex state.
+`history_base` chains and cycles, independent re-verification, and refusal of
+unknown history schemas or misaligned offsets. They also cover backup
+tampering, newer live activity, config presence changes, WAL sidecars,
+automatic rollback, and resuming an interrupted restore. Test data uses
+reserved example domains and temporary directories; it does not require real
+Codex state.
 
 ## Project status
 
