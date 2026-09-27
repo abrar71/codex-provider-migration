@@ -186,6 +186,15 @@ trust_level = "trusted"
         first["payload"]["history_mode"] = "paginated"
         first["payload"]["history_base"] = None
         lines[0] = self._line(first)
+        ordinal = 0
+        for index, line in enumerate(lines):
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            record["ordinal"] = ordinal
+            ordinal += 1
+            lines[index] = self._line(record)
         rollout = b"".join(lines)
         self.proxy_rollout.write_bytes(rollout)
 
@@ -209,7 +218,7 @@ trust_level = "trusted"
             "turn_start": first_boundary,
             "turn_end": second_boundary,
             "projection": len(rollout),
-            "projection_ordinal": len(lines),
+            "projection_ordinal": ordinal,
         }
         history_path = self.sqlite_home / migrate.HISTORY_DB_NAME
         history = sqlite3.connect(history_path)
@@ -307,6 +316,7 @@ trust_level = "trusted"
         source_lines = [
             self._line(
                 {
+                    "ordinal": 0,
                     "type": "session_meta",
                     "payload": {
                         "id": "proxy-thread",
@@ -318,6 +328,7 @@ trust_level = "trusted"
             ),
             self._line(
                 {
+                    "ordinal": 1,
                     "type": "event_msg",
                     "payload": {
                         "type": "thread_settings_applied",
@@ -327,6 +338,7 @@ trust_level = "trusted"
             ),
         ]
         padding_record = {
+            "ordinal": 2,
             "type": "event_msg",
             "payload": {"type": "user_message", "message": ""},
         }
@@ -343,6 +355,7 @@ trust_level = "trusted"
                 {
                     "type": "event_msg",
                     "payload": {"type": "user_message", "message": "after cutoff"},
+                    "ordinal": 3,
                 }
             )
         )
@@ -353,6 +366,7 @@ trust_level = "trusted"
         child_lines = [
             self._line(
                 {
+                    "ordinal": 3,
                     "type": "session_meta",
                     "payload": {
                         "id": "child-thread",
@@ -368,6 +382,7 @@ trust_level = "trusted"
             ),
             self._line(
                 {
+                    "ordinal": 4,
                     "type": "event_msg",
                     "payload": {
                         "type": "thread_settings_applied",
@@ -379,6 +394,7 @@ trust_level = "trusted"
                 {
                     "type": "event_msg",
                     "payload": {"type": "user_message", "message": "child"},
+                    "ordinal": 5,
                 }
             ),
         ]
@@ -1007,6 +1023,7 @@ class ProviderMigrationTests(unittest.TestCase):
         grandchild_rollout.write_bytes(
             MigrationFixture._line(
                 {
+                    "ordinal": 4,
                     "type": "session_meta",
                     "payload": {
                         "id": "grandchild-thread",
@@ -1051,8 +1068,8 @@ class ProviderMigrationTests(unittest.TestCase):
         )
         self.assertEqual(analysis.history_base_values, 2)
         self.assertEqual(analysis.history_base_offsets_changed, 2)
-        self.assertEqual(plan.ordinal_bias_by_thread["child-thread"], 3)
-        self.assertEqual(plan.ordinal_bias_by_thread["grandchild-thread"], 4)
+        self.assertEqual(plan.rollouts_by_id["child-thread"].ordinal_base, 3)
+        self.assertEqual(plan.rollouts_by_id["grandchild-thread"].ordinal_base, 4)
         relative = migrate.relative_rollout_path(
             self.fixture.codex_home,
             grandchild_rollout,

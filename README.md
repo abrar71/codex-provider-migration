@@ -19,14 +19,19 @@ verifies the original state from the backup before returning the error.
 ## Compatibility and supported scope
 
 The utility was developed against the legacy rollout format in Codex CLI
-0.146.0 and the paginated format in Codex CLI 0.149.0. It supports:
+0.146.0 and the paginated format in Codex CLI 0.149.0. Version 1.3.0 also checks
+the SQLite schemas from 0.157.1 and upstream commit `18344a972d` (2026-09-27).
+It supports:
 
 - plain JSONL rollouts in `sessions` and `archived_sessions`;
 - `state_5.sqlite` as the metadata database;
 - mixed legacy and paginated rollouts;
-- the `thread_history_1.sqlite` projection schema used by Codex CLI 0.149.0,
-  including its rollout byte offsets;
-- paginated `history_base` references, including chained source histories;
+- the `thread_history_1.sqlite` projection schemas used by Codex CLI 0.149.0
+  and 0.157.1, including their rollout byte offsets;
+- paginated `history_base` references, including chained source histories,
+  repeated reverts, forks of reverted threads, and archived ancestors;
+- explicit rollout ordinals, including forward gaps and recoverable skipped
+  records, while preserving the exact byte boundary of each stored offset;
 - provider metadata at these two rollout paths only:
   - `session_meta.payload.model_provider`;
   - `event_msg.payload.thread_settings.model_provider_id` when the event type is
@@ -35,6 +40,7 @@ The utility was developed against the legacy rollout format in Codex CLI
 It deliberately refuses to write if it finds:
 
 - compressed rollouts;
+- unknown history modes or ambiguous duplicate rollout IDs;
 - paginated history without its thread-history database;
 - an unknown `history_base` schema, missing source thread, reference cycle, or
   cutoff that is not on the recorded source JSONL boundary;
@@ -43,12 +49,15 @@ It deliberately refuses to write if it finds:
 - provider values at an unknown JSON path;
 - a provider-looking match inside malformed JSON;
 - a custom provider configuration that cannot be represented safely by
-  `openai_base_url`.
+  `openai_base_url`;
+- a profile that would retain a removed provider or inherit a changed endpoint
+  during config conversion;
+- ambiguous automatic SQLite discovery.
 
 For a supported paginated history, the utility validates every stored byte
 offset against the original JSONL line boundary and shifts it by the exact
 cumulative replacement delta before that boundary. For `history_base`, it
-resolves the source-thread dependency first, preserves the referenced ordinal,
+resolves the source rollout dependency first, preserves the referenced ordinal,
 and rewrites the embedded source byte offset. It then verifies every rollout
 and the entire thread-history database against the backup, allowing changes
 only to those calculated fields. A refusal means the detected format has not
@@ -74,6 +83,17 @@ Responses API, requires OpenAI authentication, and has no custom authentication,
 headers, query parameters, or other settings that the built-in provider would
 lose.
 
+Before config conversion, the tool inspects every `<name>.config.toml` profile
+in the Codex home. It refuses if a profile selects or overrides the provider
+being removed, or would inherit a different OpenAI endpoint. Resolve the named
+profile conflict first, or omit `--migrate-config` and manage the configuration
+separately. Profiles are checked again before writes and before reporting
+success; the tool never edits them. Invalid or symlinked profiles also prevent
+automatic config conversion.
+
+Preserving the endpoint and auth settings does not establish runtime proxy
+compatibility: built-in OpenAI can enable different transports and capabilities.
+
 Removing the provider table also removes comments and blank lines inside that
 table. Comments and values outside the removed selector and table are retained;
 the semantic verifier rejects changes to unrelated TOML values.
@@ -92,17 +112,63 @@ time, as any intentional config edit would.
 - A writable SQLite state directory. Opening a database whose persistent
   journal mode is WAL can make SQLite create standard empty `-wal` and `-shm`
   coordination files even though the connection is read-only.
-- All Codex CLI, IDE extension, and app-server processes stopped before apply.
+- All Codex CLI, desktop app, IDE extension, and app-server processes stopped
+  before apply, including the background daemon.
 
 The default Codex state directory is `CODEX_HOME` when that environment variable
-is set, otherwise `~/.codex`. If SQLite state is elsewhere, pass
-`--sqlite-home`; its default is `CODEX_SQLITE_HOME` and then the Codex state
-directory.
+is set, otherwise `~/.codex`. SQLite discovery uses this order:
 
-Run the migration from a separate terminal after exiting Codex. On Linux, the
-tool also checks `/proc` for processes that appear to have Codex state open. On
-systems without `/proc`, `--confirm-codex-stopped` remains an explicit promise
-from the operator rather than a process-level guarantee.
+1. Explicit `--sqlite-home`.
+2. `sqlite_home` in a selected `--profile <name>` file.
+3. `sqlite_home` in the user `config.toml`.
+4. `CODEX_SQLITE_HOME`.
+5. The Codex state directory.
+
+Relative TOML paths resolve against the directory containing that config file.
+If unselected profiles specify different SQLite directories, discovery stops
+and asks for `--profile` or `--sqlite-home`. The dry-run and apply reports include
+`sqlite_home_source`, so the selected location is visible before use. `--profile`
+selects configuration for database discovery; it does not enable profile edits.
+
+Use `--sqlite-home` for locations supplied by project config, Codex `--config`
+overrides, cloud policy, or MDM. This offline tool does not reproduce Codex's full
+configuration stack. Locally detected system/managed `sqlite_home` settings
+require an explicit path. Inside Docker, use the mounted container path as
+shown below.
+
+### Stop Codex before apply or restore
+
+Stop every process that can write to the state being migrated. Exit Codex CLI
+sessions, quit the desktop app, and disable the IDE extension or close its host
+editor. Close these clients first because they can restart app-server processes.
+
+With the current CLI, stop the managed background app-server from a separate
+terminal, using the same `CODEX_HOME` as the state being migrated:
+
+```bash
+codex app-server daemon stop
+```
+
+Stop separately launched `codex app-server` processes too. On Linux, inspect
+remaining processes with:
+
+```bash
+pgrep -af codex
+```
+
+Exit identified processes normally or send them SIGTERM. `codex app-server`
+normally uses the same executable as the CLI, so `pkill -x codex` generally
+targets both; it also affects other matching Codex sessions. Recheck that the
+processes have exited and have not restarted before applying the migration.
+
+Keep Codex stopped throughout migration and verification. If restoring later,
+repeat these shutdown steps before running `restore.py`.
+
+On Linux, apply and restore also check `/proc` for Codex processes and open
+state files. These checks do not stop processes for you. On systems without
+`/proc`, `--confirm-codex-stopped` remains an explicit promise from the operator
+rather than a process-level guarantee. Run the migrator outside Codex after
+closing the session that helped prepare it.
 
 ## Docker
 
@@ -365,8 +431,10 @@ python3 -B -m unittest discover -s tests -v
 The tests cover dry-run record immutability, exact byte changes, malformed-line
 preservation, special file modes and timestamps, SQLite-only change
 enforcement, config conversion, paginated offset migration and restoration,
-`history_base` chains and cycles, independent re-verification, and refusal of
-unknown history schemas or misaligned offsets. They also cover backup
+`history_base` chains and cycles, repeated reverts, physical rollout IDs,
+explicit ordinals and skipped records, profile dependencies, configured SQLite
+locations, independent re-verification, and refusal of unknown history schemas
+or misaligned offsets. They also cover backup
 tampering, newer live activity, config presence changes, WAL sidecars,
 automatic rollback, and resuming an interrupted restore. Test data uses
 reserved example domains and temporary directories; it does not require real

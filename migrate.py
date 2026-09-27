@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any
 
 
-TOOL_VERSION = "1.2.0"
+TOOL_VERSION = "1.3.0"
 MANIFEST_VERSION = 3
 LEGACY_MANIFEST_VERSION = 2
 MANIFEST_NAME = "migration-manifest.json"
@@ -80,7 +80,7 @@ class HistoryBaseReference:
     relative_path: str
     line_number: int
     owner_thread_id: str
-    source_thread_id: str
+    source_rollout_id: str
     end_ordinal_exclusive: int
     original_end_byte_offset: int
 
@@ -90,7 +90,22 @@ class RolloutMigrationPlan:
     migrated_bytes: dict[str, bytes]
     history_base_values: int
     history_base_offsets_changed: int
-    ordinal_bias_by_thread: dict[str, int]
+    rollouts_by_id: dict[str, RolloutIdentity]
+
+
+@dataclasses.dataclass(frozen=True)
+class RolloutIdentity:
+    relative_path: str
+    thread_id: str
+    rollout_id: str
+    ordinal_base: int
+
+
+@dataclasses.dataclass(frozen=True)
+class RolloutPositions:
+    checkpoints: dict[int, int]
+    starts: dict[int, int]
+    ends: dict[int, int]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -317,6 +332,8 @@ def assert_supported_rollout(
         return
     history_mode = payload.get("history_mode")
     history_base = payload.get("history_base")
+    if history_mode not in (None, "legacy", "paginated"):
+        raise MigrationError(f"unsupported history_mode at {path}:{line_number}")
     if history_base is not None and history_mode != "paginated":
         raise MigrationError(
             f"refusing history_base on a non-paginated rollout at {path}:{line_number}"
@@ -353,7 +370,7 @@ def analyze_rollouts(
         file_replacements = 0
         first_session_meta_seen = False
 
-        for line_number, line in enumerate(data.splitlines(keepends=True), 1):
+        for line_number, line in enumerate(jsonl_lines(data), 1):
             total_lines += 1
             if not line.strip():
                 continue
@@ -571,15 +588,162 @@ def analyze_database(db_path: Path, source_provider: str) -> DatabaseAnalysis:
     )
 
 
-def rollout_line_boundaries(value: bytes) -> dict[int, int]:
-    """Map each byte boundary between JSONL records to its next ordinal."""
+def jsonl_lines(value: bytes) -> list[bytes]:
+    """Split only at LF, matching Codex, and retain every original byte."""
+    parts = value.split(b"\n")
+    return [part + b"\n" for part in parts[:-1]] + ([parts[-1]] if parts[-1] else [])
 
-    boundaries = {0: 0}
+
+def rollout_offset_translation(original: bytes, migrated: bytes) -> dict[int, int]:
+    before = jsonl_lines(original)
+    after = jsonl_lines(migrated)
+    if len(before) != len(after):
+        raise MigrationError("rollout line boundaries changed unexpectedly")
+    offsets = {0: 0}
+    old_offset = new_offset = 0
+    for old_line, new_line in zip(before, after):
+        if old_line.endswith(b"\n") != new_line.endswith(b"\n"):
+            raise MigrationError("rollout newline changed unexpectedly")
+        old_offset += len(old_line)
+        new_offset += len(new_line)
+        offsets[old_offset] = new_offset
+    return offsets
+
+
+# Durable envelopes and events in Codex 0.149--0.157. Unknown envelopes do
+# not advance a recovered projection. A later recognized explicit ordinal
+# can establish a new checkpoint without interpreting unknown payload data.
+ROLLOUT_TYPES = {
+    "session_meta", "response_item", "inter_agent_communication",
+    "inter_agent_communication_metadata", "compacted", "turn_context",
+    "token_usage_record", "world_state", "retained_context",
+    "security_risk_score", "realtime_item", "event_msg",
+}
+# EventMsg tags, including historical task_* names, from upstream 18344a972d.
+# Count recognized transient events too: older/imported files can contain them.
+KNOWN_EVENT_TYPES = frozenset("""
+agent_message agent_message_content_delta agent_reasoning agent_reasoning_raw_content
+agent_reasoning_section_break apply_patch_approval_request auth_recovery_completed
+auth_recovery_started collab_agent_interaction_begin collab_agent_interaction_end
+collab_agent_spawn_begin collab_agent_spawn_end collab_close_begin collab_close_end
+collab_resume_begin collab_resume_end collab_waiting_begin collab_waiting_end
+context_compacted deprecation_notice dynamic_tool_call_request
+dynamic_tool_call_response elicitation_request entered_review_mode
+environment_connected environment_disconnected error exec_approval_request
+exec_command_begin exec_command_end exec_command_output_delta exited_review_mode
+guardian_assessment guardian_warning hook_completed hook_started image_generation_begin
+image_generation_end item_completed item_started mcp_startup_complete
+mcp_startup_update mcp_tool_call_begin mcp_tool_call_end model_reroute
+model_verification patch_apply_begin patch_apply_end patch_apply_updated plan_delta
+plan_update raw_response_completed raw_response_item realtime_conversation_closed
+realtime_conversation_list_voices_response realtime_conversation_realtime
+realtime_conversation_sdp realtime_conversation_started reasoning_content_delta
+reasoning_raw_content_delta request_permissions request_user_input safety_buffering
+session_configured shutdown_complete stream_error sub_agent_activity task_complete
+task_started terminal_interaction thread_goal_updated thread_queue_changed
+thread_rolled_back thread_settings_applied token_count turn_aborted turn_complete
+turn_diff turn_moderation_metadata turn_started user_message view_image_tool_call
+warning web_search_begin web_search_end
+""".split())
+
+
+def rollout_positions(value: bytes, ordinal_base: int) -> RolloutPositions:
+    """Validate positions using explicit ordinals, independently of byte shifts.
+
+    Follow the projection's recovery rules for skipped lines, reused ordinals,
+    and forward gaps. Payloads are not fully decoded as Rust types: an offset
+    whose recorded ordinal cannot be established from these envelopes fails
+    closed. An unterminated last record is never a projected position.
+    """
+    checkpoints = {0: ordinal_base}
+    starts: dict[int, int] = {}
+    ends: dict[int, int] = {}
+    next_ordinal = ordinal_base
     offset = 0
-    for ordinal, line in enumerate(value.splitlines(keepends=True), 1):
-        offset += len(line)
-        boundaries[offset] = ordinal
-    return boundaries
+    first_meta = True
+    for line in jsonl_lines(value):
+        if not line.endswith(b"\n"):
+            break
+        end = offset + len(line)
+        try:
+            record = json.loads(line)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            record = None
+        if isinstance(record, dict):
+            ordinal = record.get("ordinal")
+            kind = record.get("type")
+            payload = record.get("payload")
+            if kind == "session_meta" and first_meta:
+                first_meta = False
+                if type(ordinal) is not int or ordinal != ordinal_base:
+                    raise MigrationError(
+                        "paginated session_meta ordinal does not match history base"
+                    )
+            recognized = isinstance(kind, str) and kind in ROLLOUT_TYPES
+            recognized = recognized and isinstance(payload, dict)
+            if recognized and kind == "event_msg":
+                event_type = payload.get("type")
+                recognized = (
+                    isinstance(event_type, str) and event_type in KNOWN_EVENT_TYPES
+                )
+            if (
+                recognized
+                and type(ordinal) is int
+                and next_ordinal <= ordinal < 2**63 - 1
+            ):
+                starts[offset] = ordinal
+                ends[end] = ordinal
+                next_ordinal = ordinal + 1
+        checkpoints[end] = next_ordinal
+        offset = end
+    return RolloutPositions(checkpoints, starts, ends)
+
+
+def index_paginated_rollouts(
+    original_by_relative: dict[str, bytes],
+) -> dict[str, RolloutIdentity]:
+    uuid = r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}"
+    canonical = re.compile(
+        rf"rollout-\d{{4}}-\d{{2}}-\d{{2}}T\d{{2}}-\d{{2}}-\d{{2}}-"
+        rf"(?P<thread>{uuid})(?:_(?P<rollout>{uuid}))?\.jsonl"
+    )
+    result: dict[str, RolloutIdentity] = {}
+    for relative, data in original_by_relative.items():
+        for line in jsonl_lines(data):
+            try:
+                record = json.loads(line)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            if isinstance(record, dict) and record.get("type") == "session_meta":
+                break
+        else:
+            continue
+        payload = record.get("payload")
+        if not isinstance(payload, dict) or payload.get("history_mode") != "paginated":
+            continue
+        thread_id = payload.get("id")
+        if not isinstance(thread_id, str) or not thread_id or "\x00" in thread_id:
+            raise MigrationError(f"invalid paginated thread identity: {relative}")
+        name = Path(relative).name
+        match = canonical.fullmatch(name)
+        if match:
+            if match["thread"] != thread_id:
+                raise MigrationError(f"rollout filename disagrees with session_meta.id: {relative}")
+            rollout_id = match["rollout"] or match["thread"]
+        else:
+            # Retain support for older noncanonical single-rollout names. They
+            # cannot encode replacements, and duplicate IDs are always refused.
+            if re.match(r"rollout-\d{4}-", name) or "_" in name:
+                raise MigrationError(f"unrecognized rollout filename: {relative}")
+            rollout_id = thread_id
+        if rollout_id in result:
+            raise MigrationError(f"ambiguous duplicate rollout ID: {rollout_id}")
+        base = payload.get("history_base")
+        ordinal_base = base.get("end_ordinal_exclusive") if isinstance(base, dict) else 0
+        if type(ordinal_base) is not int or ordinal_base < 0:
+            raise MigrationError(f"invalid rollout ordinal base: {relative}")
+        result[rollout_id] = RolloutIdentity(relative, thread_id, rollout_id, ordinal_base)
+    return result
 
 
 def resolve_recorded_rollout_path(codex_home: Path, recorded: Any) -> Path:
@@ -629,26 +793,6 @@ def resolve_recorded_rollout_path(codex_home: Path, recorded: Any) -> Path:
             f"recorded paginated rollout is missing or unsafe: {candidate}"
         )
     return candidate
-
-
-def rollout_contains_paginated_thread(path: Path, thread_id: str) -> bool:
-    for line in path.read_bytes().splitlines():
-        if not line.strip():
-            continue
-        try:
-            record = json.loads(line)
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            continue
-        if not isinstance(record, dict) or record.get("type") != "session_meta":
-            continue
-        payload = record.get("payload")
-        if (
-            isinstance(payload, dict)
-            and payload.get("id") == thread_id
-            and payload.get("history_mode") == "paginated"
-        ):
-            return True
-    return False
 
 
 def history_base_paths(
@@ -718,7 +862,6 @@ def parse_history_base_reference(
         or not isinstance(source_thread_id, str)
         or not source_thread_id
         or "\x00" in source_thread_id
-        or source_thread_id == owner_thread_id
         or type(end_ordinal) is not int
         or end_ordinal <= 0
         or type(end_offset) is not int
@@ -731,7 +874,7 @@ def parse_history_base_reference(
         relative_path=relative_path,
         line_number=line_number,
         owner_thread_id=owner_thread_id,
-        source_thread_id=source_thread_id,
+        source_rollout_id=source_thread_id,
         end_ordinal_exclusive=end_ordinal,
         original_end_byte_offset=end_offset,
     )
@@ -783,7 +926,7 @@ def build_rollout_migration_plan(
 
     for relative, data in original_by_relative.items():
         first_session_meta_line: int | None = None
-        for line_number, line in enumerate(data.splitlines(keepends=True), 1):
+        for line_number, line in enumerate(jsonl_lines(data), 1):
             if not line.strip():
                 continue
             try:
@@ -810,87 +953,21 @@ def build_rollout_migration_plan(
         for relative_references in references_by_relative.values()
         for reference in relative_references
     ]
-    if not references:
-        return RolloutMigrationPlan(
-            migrated_bytes={
-                relative: replace_provider_bytes(
-                    data,
-                    source_provider,
-                    target_provider,
-                )[0]
-                for relative, data in original_by_relative.items()
-            },
-            history_base_values=0,
-            history_base_offsets_changed=0,
-            ordinal_bias_by_thread={},
-        )
-
-    validate_state_db_path(state_db_path)
-    state = sqlite3.connect(
-        sqlite_read_only_uri(state_db_path, immutable=immutable), uri=True
-    )
-    try:
-        columns = {
-            row[1] for row in state.execute('PRAGMA table_info("threads")')
-        }
-        required_columns = {"id", "rollout_path", "history_mode"}
-        if not required_columns.issubset(columns):
-            raise MigrationError(
-                "state database lacks history_base thread path metadata"
-            )
-        state_threads = {
-            row[0]: (row[1], row[2])
-            for row in state.execute(
-                "SELECT id, rollout_path, history_mode FROM threads"
-            )
-        }
-    finally:
-        state.close()
-
-    relative_by_thread: dict[str, str] = {}
-
-    def thread_relative_path(thread_id: str) -> str:
-        cached = relative_by_thread.get(thread_id)
-        if cached is not None:
-            return cached
-        state_thread = state_threads.get(thread_id)
-        if state_thread is None:
-            raise MigrationError("history_base references an unknown state thread")
-        recorded_path, history_mode = state_thread
-        if history_mode != "paginated":
-            raise MigrationError(
-                "history_base references a non-paginated state thread"
-            )
-        path = resolve_recorded_rollout_path(codex_home, recorded_path)
-        relative = relative_rollout_path(codex_home, path)
-        if relative not in original_by_relative:
-            raise MigrationError("history_base rollout is outside the migration set")
-        if not rollout_contains_paginated_thread(path, thread_id):
-            raise MigrationError(
-                "history_base rollout metadata does not match its state thread"
-            )
-        relative_by_thread[thread_id] = relative
-        return relative
-
+    rollouts_by_id = index_paginated_rollouts(original_by_relative)
+    identities_by_relative = {
+        identity.relative_path: identity for identity in rollouts_by_id.values()
+    }
     dependencies: dict[str, set[str]] = {
         relative: set() for relative in original_by_relative
     }
-    ordinal_bias_by_thread: dict[str, int] = {}
     for reference in references:
-        if reference.owner_thread_id in ordinal_bias_by_thread:
-            raise MigrationError(
-                "multiple history_base records exist for one owner thread"
-            )
-        ordinal_bias_by_thread[reference.owner_thread_id] = (
-            reference.end_ordinal_exclusive
-        )
-        owner_relative = thread_relative_path(reference.owner_thread_id)
-        if owner_relative != reference.relative_path:
-            raise MigrationError(
-                "history_base owner thread points to a different rollout"
-            )
-        source_relative = thread_relative_path(reference.source_thread_id)
-        dependencies[reference.relative_path].add(source_relative)
+        owner = identities_by_relative.get(reference.relative_path)
+        if owner is None or owner.thread_id != reference.owner_thread_id:
+            raise MigrationError("history_base owner has no matching paginated rollout")
+        source = rollouts_by_id.get(reference.source_rollout_id)
+        if source is None:
+            raise MigrationError("history_base references an unknown source rollout")
+        dependencies[reference.relative_path].add(source.relative_path)
 
     migrated_by_relative: dict[str, bytes] = {}
     visiting: set[str] = set()
@@ -906,6 +983,10 @@ def build_rollout_migration_plan(
         for dependency in dependencies[relative]:
             migrate_relative(dependency)
 
+        identity = identities_by_relative.get(relative)
+        if identity is not None:
+            rollout_positions(original_by_relative[relative], identity.ordinal_base)
+
         references_by_line = {
             reference.line_number: reference
             for reference in references_by_relative[relative]
@@ -914,7 +995,7 @@ def build_rollout_migration_plan(
             raise MigrationError("multiple history_base records share a JSONL line")
         migrated_lines: list[bytes] = []
         for line_number, line in enumerate(
-            original_by_relative[relative].splitlines(keepends=True), 1
+            jsonl_lines(original_by_relative[relative]), 1
         ):
             migrated_line, _ = replace_provider_bytes(
                 line,
@@ -923,44 +1004,22 @@ def build_rollout_migration_plan(
             )
             reference = references_by_line.get(line_number)
             if reference is not None:
-                source_relative = thread_relative_path(reference.source_thread_id)
-                source_ordinal_bias = ordinal_bias_by_thread.get(
-                    reference.source_thread_id,
-                    0,
-                )
-                source_local_ordinal = (
-                    reference.end_ordinal_exclusive - source_ordinal_bias
-                )
-                if source_local_ordinal <= 0:
-                    raise MigrationError(
-                        "history_base cutoff does not include source-local history at "
-                        f"{reference.relative_path}:{reference.line_number}"
-                    )
-                source_original_boundaries = rollout_line_boundaries(
-                    original_by_relative[source_relative]
-                )
-                actual_ordinal = source_original_boundaries.get(
-                    reference.original_end_byte_offset
-                )
-                if actual_ordinal != source_local_ordinal:
+                source = rollouts_by_id[reference.source_rollout_id]
+                source_relative = source.relative_path
+                original_source = original_by_relative[source_relative]
+                positions = rollout_positions(original_source, source.ordinal_base)
+                actual_ordinal = positions.checkpoints.get(reference.original_end_byte_offset)
+                if (
+                    reference.end_ordinal_exclusive <= source.ordinal_base
+                    or actual_ordinal != reference.end_ordinal_exclusive
+                ):
                     raise MigrationError(
                         "history_base offset is not on its recorded source boundary at "
                         f"{reference.relative_path}:{reference.line_number}"
                     )
-                source_migrated_boundaries = {
-                    ordinal: offset
-                    for offset, ordinal in rollout_line_boundaries(
-                        migrated_by_relative[source_relative]
-                    ).items()
-                }
-                migrated_offset = source_migrated_boundaries.get(
-                    source_local_ordinal
-                )
-                if migrated_offset is None:
-                    raise MigrationError(
-                        "migrated history_base source boundary is missing at "
-                        f"{reference.relative_path}:{reference.line_number}"
-                    )
+                migrated_offset = rollout_offset_translation(
+                    original_source, migrated_by_relative[source_relative]
+                )[reference.original_end_byte_offset]
                 migrated_line = replace_history_base_offset(
                     migrated_line,
                     reference,
@@ -996,8 +1055,8 @@ def build_rollout_migration_plan(
                     migrated_history_bases += 1
             migrated_lines.append(migrated_line)
         migrated = b"".join(migrated_lines)
-        if len(migrated.splitlines(keepends=True)) != len(
-            original_by_relative[relative].splitlines(keepends=True)
+        if len(jsonl_lines(migrated)) != len(
+            jsonl_lines(original_by_relative[relative])
         ):
             raise MigrationError(
                 f"rollout line boundaries changed unexpectedly: {relative}"
@@ -1011,7 +1070,7 @@ def build_rollout_migration_plan(
         migrated_bytes=migrated_by_relative,
         history_base_values=len(references),
         history_base_offsets_changed=migrated_history_bases,
-        ordinal_bias_by_thread=ordinal_bias_by_thread,
+        rollouts_by_id=rollouts_by_id,
     )
 
 
@@ -1194,87 +1253,65 @@ def inspect_history_database(
             for _, history_mode in state_threads.values()
         )
 
-        referenced_threads: set[str] = set()
-        for table in required_tables:
-            referenced_threads.update(
-                row[0]
-                for row in history.execute(
-                    f"SELECT DISTINCT thread_id FROM {quoted_identifier(table)}"
-                )
-            )
-        rollout_by_thread: dict[str, Path] = {}
-        for thread_id in referenced_threads:
-            if not isinstance(thread_id, str) or thread_id not in state_threads:
-                raise MigrationError(
-                    "thread-history database references an unknown state thread"
-                )
-            recorded_path, history_mode = state_threads[thread_id]
+        # State rows select the current physical file of a logical thread.
+        # Projection rows and history_base pointers instead identify immutable
+        # physical rollouts, including retained files absent from threads.id.
+        identities = rollout_migration.rollouts_by_id
+        by_relative = {item.relative_path: item for item in identities.values()}
+        for thread_id, (recorded_path, history_mode) in state_threads.items():
             if history_mode != "paginated":
-                raise MigrationError(
-                    "thread-history database references a non-paginated state thread"
-                )
-            rollout = resolve_recorded_rollout_path(codex_home, recorded_path)
-            if not rollout_contains_paginated_thread(rollout, thread_id):
-                raise MigrationError(
-                    "paginated rollout metadata does not match its state thread"
-                )
-            rollout_by_thread[thread_id] = rollout
+                continue
+            selected = resolve_recorded_rollout_path(codex_home, recorded_path)
+            identity = by_relative.get(relative_rollout_path(codex_home, selected))
+            if identity is None or identity.thread_id != thread_id:
+                raise MigrationError("paginated rollout metadata does not match its state thread")
 
-        translation_cache: dict[Path, tuple[dict[int, int], dict[int, int]]] = {}
+        referenced_rollouts: set[str] = set()
+        for table, columns in columns_by_table.items():
+            if "thread_id" in columns:
+                referenced_rollouts.update(
+                    row[0]
+                    for row in history.execute(
+                        f"SELECT DISTINCT thread_id FROM {quoted_identifier(table)}"
+                    )
+                )
+        for rollout_id in referenced_rollouts:
+            if not isinstance(rollout_id, str) or rollout_id not in identities:
+                raise MigrationError(
+                    "thread-history database references an unknown paginated rollout"
+                )
+
+        translation_cache: dict[str, tuple[RolloutPositions, dict[int, int]]] = {}
 
         def translate(
-            thread_id: str,
+            rollout_id: str,
             offset: Any,
             ordinal: Any,
             *,
-            end_offset: bool,
+            position: str,
             label: str,
         ) -> int:
             if type(offset) is not int or type(ordinal) is not int:
                 raise MigrationError(f"invalid thread-history offset pair: {label}")
-            rollout = rollout_by_thread.get(thread_id)
-            if rollout is None:
-                raise MigrationError(
-                    f"thread-history offset has no paginated rollout: {label}"
-                )
-            cached = translation_cache.get(rollout)
+            identity = identities.get(rollout_id)
+            if identity is None:
+                raise MigrationError(f"thread-history offset has no paginated rollout: {label}")
+            cached = translation_cache.get(rollout_id)
             if cached is None:
-                data = rollout.read_bytes()
-                relative = relative_rollout_path(codex_home, rollout)
-                migrated_data = rollout_migration.migrated_bytes.get(relative)
-                if migrated_data is None:
-                    raise MigrationError(
-                        "thread-history rollout is absent from the migration plan"
-                    )
+                data = (codex_home / identity.relative_path).read_bytes()
+                migrated_data = rollout_migration.migrated_bytes[identity.relative_path]
                 cached = (
-                    rollout_line_boundaries(data),
-                    {
-                        ordinal: migrated_offset
-                        for migrated_offset, ordinal in rollout_line_boundaries(
-                            migrated_data
-                        ).items()
-                    },
+                    rollout_positions(data, identity.ordinal_base),
+                    rollout_offset_translation(data, migrated_data),
                 )
-                translation_cache[rollout] = cached
-            boundaries, migrated_boundaries = cached
-            local_ordinal = boundaries.get(offset)
-            ordinal_bias = rollout_migration.ordinal_bias_by_thread.get(
-                thread_id,
-                0,
-            )
-            if (
-                local_ordinal is None
-                or local_ordinal + ordinal_bias != ordinal + int(end_offset)
-            ):
+                translation_cache[rollout_id] = cached
+            positions, offsets = cached
+            boundaries = getattr(positions, position)
+            if boundaries.get(offset) != ordinal or offset not in boundaries:
                 raise MigrationError(
                     f"thread-history offset is not on its recorded JSONL boundary: {label}"
                 )
-            migrated_offset = migrated_boundaries.get(local_ordinal)
-            if migrated_offset is None:
-                raise MigrationError(
-                    f"migrated thread-history offset misses its JSONL boundary: {label}"
-                )
-            return migrated_offset
+            return offsets[offset]
 
         updates: list[HistoryOffsetUpdate] = []
         for thread_id, offset, ordinal in history.execute(
@@ -1285,7 +1322,7 @@ def inspect_history_database(
                 thread_id,
                 offset,
                 ordinal,
-                end_offset=False,
+                position="checkpoints",
                 label="thread_history_projection_state.next_rollout_byte_offset",
             )
             if migrated != offset:
@@ -1319,7 +1356,7 @@ def inspect_history_database(
                     thread_id,
                     start_offset,
                     start_ordinal,
-                    end_offset=False,
+                    position="starts",
                     label="thread_turns.rollout_byte_offset",
                 )
                 if migrated != start_offset:
@@ -1342,7 +1379,7 @@ def inspect_history_database(
                     thread_id,
                     end_offset,
                     end_ordinal,
-                    end_offset=True,
+                    position="ends",
                     label="thread_turns.rollout_end_byte_offset",
                 )
                 if migrated != end_offset:
@@ -1476,6 +1513,59 @@ def apply_history_offset_updates(
         return changed
     finally:
         connection.close()
+
+
+def read_config_file(path: Path, *, required: bool = False) -> dict[str, Any]:
+    if path.is_symlink():
+        raise MigrationError(f"refusing symlinked config: {path}")
+    if not path.exists() and not required:
+        return {}
+    try:
+        return tomllib.loads(path.read_text(encoding="utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        raise MigrationError(f"cannot parse config {path}: {exc}") from exc
+
+
+def read_profile_configs(codex_home: Path) -> dict[Path, dict[str, Any]]:
+    return {
+        path: read_config_file(path, required=True)
+        for path in sorted(codex_home.glob("*.config.toml"))
+    }
+
+
+def validate_config_profiles(codex_home: Path, before: bytes, after: bytes) -> None:
+    """Check dependencies without editing or taking ownership of profile files."""
+    original = tomllib.loads(before.decode("utf-8"))
+    migrated = tomllib.loads(after.decode("utf-8"))
+    if "profile" in original or "profiles" in original:
+        raise MigrationError(
+            "legacy profile selectors/tables are unsupported; move them to "
+            "<name>.config.toml before --migrate-config"
+        )
+    source = original["model_provider"]
+    for path, profile in read_profile_configs(codex_home).items():
+        providers = profile.get("model_providers", {})
+        if not isinstance(providers, dict):
+            raise MigrationError(f"invalid profile provider definitions: {path}")
+        if profile.get("model_provider") == source or source in providers:
+            raise MigrationError(
+                f"profile {path.name} depends on provider {source!r}; "
+                "update that profile before --migrate-config, or omit --migrate-config"
+            )
+        provider_before = profile.get("model_provider", source)
+        provider_after = profile.get("model_provider", "openai")
+        if provider_after == "openai":
+            old_url = (
+                original["model_providers"][source]["base_url"]
+                if provider_before == source
+                else profile.get("openai_base_url", original.get("openai_base_url"))
+            )
+            new_url = profile.get("openai_base_url", migrated.get("openai_base_url"))
+            if old_url != new_url:
+                raise MigrationError(
+                    f"config conversion would change the endpoint inherited by profile "
+                    f"{path.name}; set its intended openai_base_url before --migrate-config"
+                )
 
 
 def transform_config(
@@ -2352,9 +2442,9 @@ def verify_against_backup(
         if original_stat.st_mtime_ns != migrated_stat.st_mtime_ns:
             raise MigrationError(f"rollout mtime changed: {relative}")
 
-        original_lines = original.splitlines(keepends=True)
-        migrated_lines = migrated.splitlines(keepends=True)
-        expected_lines = expected.splitlines(keepends=True)
+        original_lines = jsonl_lines(original)
+        migrated_lines = jsonl_lines(migrated)
+        expected_lines = jsonl_lines(expected)
         if not (
             len(original_lines) == len(migrated_lines) == len(expected_lines)
         ):
@@ -3210,6 +3300,7 @@ def apply_migration(
         config_after = transform_config(
             config_before, source_provider, target_provider
         )
+        validate_config_profiles(codex_home, config_before, config_after)
 
     manifest = create_backup(
         codex_home=codex_home,
@@ -3305,6 +3396,10 @@ def apply_migration(
                 "no migration was applied"
             )
 
+    if config_after is not None:
+        # Profiles can be created or changed while the backup is being taken.
+        validate_config_profiles(codex_home, config_before, config_after)
+
     # Roll back on ordinary failures and operator interruption alike. Once the
     # first atomic replacement starts, returning without attempting recovery
     # would leave the cross-file migration in an unknown partial state.
@@ -3372,6 +3467,7 @@ def apply_migration(
 
         if config_after is not None:
             atomic_write(config_path, config_after, preserve_mtime=False)
+            validate_config_profiles(codex_home, config_before, config_after)
 
         report = verify_against_backup(
             backup_dir=backup_dir,
@@ -3415,9 +3511,82 @@ def default_codex_home() -> Path:
     return Path(configured) if configured else Path.home() / ".codex"
 
 
-def default_sqlite_home(codex_home: Path) -> Path:
+def configured_sqlite_path(value: Any, config_path: Path) -> Path:
+    if not isinstance(value, str) or not value.strip() or "\x00" in value:
+        raise MigrationError(f"invalid sqlite_home in {config_path}; pass --sqlite-home explicitly")
+    path = Path(value)
+    # Codex expands ~ and ~/..., but not shell-style ~other-user paths.
+    if value == "~" or value.startswith("~/") or (os.name == "nt" and value.startswith("~\\")):
+        path = path.expanduser()
+    return (path if path.is_absolute() else config_path.parent / path).resolve()
+
+
+def resolve_sqlite_home(
+    codex_home: Path,
+    *,
+    explicit: Path | None = None,
+    profile: str | None = None,
+) -> tuple[Path, str]:
+    if explicit is not None:
+        return explicit.resolve(), "--sqlite-home"
+    config_path = codex_home / "config.toml"
+    base = read_config_file(config_path)
+    if "profile" in base or "profiles" in base:
+        raise MigrationError(
+            "legacy profile configuration makes SQLite discovery ambiguous; pass --sqlite-home"
+        )
     configured = os.environ.get("CODEX_SQLITE_HOME")
-    return Path(configured) if configured else codex_home
+    if "sqlite_home" in base:
+        selected = configured_sqlite_path(base["sqlite_home"], config_path)
+        source = str(config_path)
+    elif configured:
+        selected = configured_sqlite_path(configured, Path.cwd() / "CODEX_SQLITE_HOME")
+        source = "CODEX_SQLITE_HOME"
+    else:
+        selected = codex_home.resolve()
+        source = "Codex home"
+
+    # Managed settings can override user files. Do not guess their effective
+    # precedence (or the contents of cloud/MDM policy) in this offline utility.
+    if os.name == "nt":
+        program_data = os.environ.get("ProgramData")
+        system_root = Path(program_data) / "OpenAI" / "Codex" if program_data else None
+    else:
+        system_root = Path("/etc/codex")
+    external_paths = [codex_home / "managed_config.toml"]
+    if system_root is not None:
+        external_paths.extend(system_root / name for name in (
+            "config.toml", "requirements.toml", "managed_config.toml"
+        ))
+    for path in external_paths:
+        if "sqlite_home" in read_config_file(path):
+            raise MigrationError(
+                f"SQLite location also configured in {path}; pass --sqlite-home explicitly"
+            )
+
+    if profile is not None:
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", profile):
+            raise MigrationError("--profile must be a bare profile name")
+        path = codex_home / f"{profile}.config.toml"
+        values = read_config_file(path, required=True)
+        if "sqlite_home" in values:
+            selected = configured_sqlite_path(values["sqlite_home"], path)
+            source = str(path)
+    else:
+        for path, values in read_profile_configs(codex_home).items():
+            if (
+                "sqlite_home" in values
+                and configured_sqlite_path(values["sqlite_home"], path) != selected
+            ):
+                raise MigrationError(
+                    f"profile {path.name} uses a different SQLite directory; "
+                    "select --profile or pass --sqlite-home explicitly"
+                )
+    return selected, source
+
+
+def default_sqlite_home(codex_home: Path) -> Path:
+    return resolve_sqlite_home(codex_home)[0]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -3434,7 +3603,14 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help=(
             "directory containing state_5.sqlite "
-            "(default: CODEX_SQLITE_HOME or Codex state)"
+            "(default: user/profile sqlite_home, CODEX_SQLITE_HOME, or Codex state)"
+        ),
+    )
+    parser.add_argument(
+        "--profile",
+        help=(
+            "Codex profile name for SQLite discovery (<name>.config.toml); "
+            "profile files are not edited"
         ),
     )
     parser.add_argument(
@@ -3487,7 +3663,9 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         codex_home = args.codex_home.resolve()
-        sqlite_home = (args.sqlite_home or default_sqlite_home(codex_home)).resolve()
+        sqlite_home, sqlite_home_source = resolve_sqlite_home(
+            codex_home, explicit=args.sqlite_home, profile=args.profile
+        )
         if args.from_provider == args.to_provider:
             raise MigrationError("source and target provider are identical")
         if not codex_home.is_dir():
@@ -3512,6 +3690,8 @@ def main(argv: list[str] | None = None) -> int:
                 {
                     "result": "migration and verification passed",
                     "backup_dir": str(args.backup_dir.resolve()),
+                    "sqlite_home": str(sqlite_home),
+                    "sqlite_home_source": sqlite_home_source,
                     **dataclasses.asdict(report),
                 },
                 args.json,
@@ -3536,9 +3716,9 @@ def main(argv: list[str] | None = None) -> int:
         config_status = "not requested"
         if args.migrate_config:
             config_path = codex_home / "config.toml"
-            transform_config(
-                config_path.read_bytes(), args.from_provider, args.to_provider
-            )
+            original = config_path.read_bytes()
+            transformed = transform_config(original, args.from_provider, args.to_provider)
+            validate_config_profiles(codex_home, original, transformed)
             config_status = "eligible"
         emit(
             {
@@ -3548,6 +3728,7 @@ def main(argv: list[str] | None = None) -> int:
                 ),
                 "codex_home": str(codex_home),
                 "sqlite_home": str(sqlite_home),
+                "sqlite_home_source": sqlite_home_source,
                 "from_provider": args.from_provider,
                 "to_provider": args.to_provider,
                 "config_migration": config_status,
