@@ -14,21 +14,36 @@ import collections
 import copy
 import dataclasses
 import datetime as dt
+import functools
+import graphlib
 import hashlib
+import itertools
 import json
 import os
 import re
 import shutil
 import sqlite3
 import stat
-import sys
 import tempfile
-import tomllib
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
+import tomllib
 
-TOOL_VERSION = "1.3.0"
+import migration_workers as workers
+import progress
+from migration_io import (
+    ByteEdit,
+    FilePlan,
+    MigrationError,
+    file_chunks,
+    files_equal,
+    matches_chunks,
+    records,
+)
+
+TOOL_VERSION = "1.5.1"
 MANIFEST_VERSION = 3
 LEGACY_MANIFEST_VERSION = 2
 MANIFEST_NAME = "migration-manifest.json"
@@ -49,10 +64,6 @@ PERSISTENT_SQLITE_PRAGMAS = (
     "schema_version",
     "user_version",
 )
-
-
-class MigrationError(RuntimeError):
-    """Raised when a safety precondition or verification check fails."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -87,7 +98,9 @@ class HistoryBaseReference:
 
 @dataclasses.dataclass(frozen=True)
 class RolloutMigrationPlan:
-    migrated_bytes: dict[str, bytes]
+    files: dict[str, FilePlan]
+    positions: dict[str, RolloutPositions]
+    analysis: RolloutAnalysis
     history_base_values: int
     history_base_offsets_changed: int
     rollouts_by_id: dict[str, RolloutIdentity]
@@ -175,6 +188,7 @@ def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            workers.check_cancelled()
             digest.update(chunk)
     return digest.hexdigest()
 
@@ -209,10 +223,12 @@ def artifact_descriptor(
     }
 
 
+@functools.lru_cache(maxsize=32)
 def json_string_bytes(value: str) -> bytes:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
+@functools.lru_cache(maxsize=32)
 def provider_pattern(key: str, provider: str) -> re.Pattern[bytes]:
     return re.compile(
         rb'("'
@@ -222,13 +238,12 @@ def provider_pattern(key: str, provider: str) -> re.Pattern[bytes]:
     )
 
 
+@functools.lru_cache(maxsize=32)
 def replacement_patterns(
     source_provider: str, target_provider: str
 ) -> list[tuple[re.Pattern[bytes], bytes]]:
     target = json_string_bytes(target_provider)
-    return [
-        (provider_pattern(key, source_provider), target) for key in PROVIDER_KEYS
-    ]
+    return [(provider_pattern(key, source_provider), target) for key in PROVIDER_KEYS]
 
 
 def replace_provider_bytes(
@@ -237,7 +252,9 @@ def replace_provider_bytes(
     updated = value
     replacements = 0
     for pattern, target in replacement_patterns(source_provider, target_provider):
-        updated, count = pattern.subn(lambda match: match.group(1) + target, updated)
+        updated, count = pattern.subn(
+            lambda match, target=target: match.group(1) + target, updated
+        )
         replacements += count
     return updated, replacements
 
@@ -269,6 +286,8 @@ def relative_rollout_path(codex_home: Path, path: Path) -> str:
 
 
 def count_raw_provider_matches(line: bytes, source_provider: str) -> int:
+    if b"model_provider" not in line or json_string_bytes(source_provider) not in line:
+        return 0
     return sum(
         len(provider_pattern(key, source_provider).findall(line))
         for key in PROVIDER_KEYS
@@ -345,101 +364,197 @@ def assert_supported_rollout(
         )
 
 
-def analyze_rollouts(
+def scan_rollout_file(task):
+    codex_home, path, source_provider, target_provider, allow_paginated = task
+    hashes: dict[str, str] = {}
+    metadata: dict[str, dict[str, int]] = {}
+    files: dict[str, FilePlan] = {}
+    identities: dict[str, RolloutIdentity] = {}
+    references: list[tuple[HistoryBaseReference, ByteEdit]] = []
+    heads = changed = meta_count = settings_count = malformed = valid = total = 0
+    patterns = replacement_patterns(source_provider, target_provider)
+    source_bytes = json_string_bytes(source_provider)
+    target_bytes = json_string_bytes(target_provider)
+    relative = relative_rollout_path(codex_home, path)
+    before_stat = path.stat()
+    metadata[relative] = capture_file_metadata(path)
+    digest = hashlib.sha256()
+    edits: list[ByteEdit] = []
+    first_meta: int | None = None
+    file_replacements = offset = pending_bytes = 0
+    for number, line in enumerate(records(path), 1):
+        digest.update(line)
+        line_offset = offset
+        offset += len(line)
+        pending_bytes += len(line)
+        if pending_bytes >= 1024 * 1024:
+            workers.advance(pending_bytes)
+            pending_bytes = 0
+        total += 1
+        if not line.strip():
+            continue
+        raw_matches = count_raw_provider_matches(line, source_provider)
+        try:
+            record = json.loads(line)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            malformed += 1
+            if raw_matches or re.search(rb'"history_base"\s*:', line):
+                raise MigrationError(
+                    "refusing migration metadata inside an unparseable JSONL line at "
+                    f"{path}:{number}"
+                ) from None
+            continue
+        valid += 1
+        assert_supported_rollout(record, path, number, allow_paginated=allow_paginated)
+        unknown = walk_provider_values(record, source_provider)
+        if unknown:
+            raise MigrationError(
+                f"refusing unknown provider metadata path at {path}:{number}: "
+                + ", ".join(".".join(item) for item in unknown)
+            )
+        meta, settings = structural_provider_changes(record, source_provider)
+        if raw_matches != meta + settings:
+            raise MigrationError(
+                "provider byte matches do not map one-to-one to known metadata at "
+                f"{path}:{number} (raw={raw_matches}, structural={meta + settings})"
+            )
+        meta_count += meta
+        settings_count += settings
+        file_replacements += meta + settings
+        if raw_matches and source_bytes != target_bytes:
+            for pattern, _ in patterns:
+                for match in pattern.finditer(line):
+                    edits.append(
+                        ByteEdit(
+                            line_offset + match.end(1),
+                            source_bytes,
+                            target_bytes,
+                        )
+                    )
+        if (
+            isinstance(record, dict)
+            and record.get("type") == "session_meta"
+            and first_meta is None
+        ):
+            first_meta = number
+            payload = record.get("payload")
+            if (
+                isinstance(payload, dict)
+                and payload.get("model_provider") == source_provider
+            ):
+                heads += 1
+            found = index_paginated_rollouts({relative: line})
+            if identities.keys() & found.keys():
+                raise MigrationError("ambiguous duplicate rollout ID")
+            identities.update(found)
+        reference = parse_history_base_reference(record, relative, number, first_meta)
+        if reference is not None:
+            # Require the same unique, canonical numeric token as the original verifier.
+            replace_history_base_offset(
+                line, reference, reference.original_end_byte_offset
+            )
+            match = re.search(rb'"end_byte_offset"\s*:\s*([0-9]+)', line)
+            if match is None:
+                raise MigrationError("history_base offset token is missing")
+            references.append(
+                (
+                    reference,
+                    ByteEdit(line_offset + match.start(1), match[1], match[1]),
+                )
+            )
+    after_stat = path.stat()
+    if (before_stat.st_size, before_stat.st_mtime_ns, before_stat.st_ino) != (
+        after_stat.st_size,
+        after_stat.st_mtime_ns,
+        after_stat.st_ino,
+    ) or offset != before_stat.st_size:
+        raise MigrationError(
+            f"rollout changed during preflight: {path}; stop Codex and retry"
+        )
+    hashes[relative] = digest.hexdigest()
+    files[relative] = FilePlan(
+        offset, hashes[relative], tuple(sorted(edits, key=lambda e: e.offset))
+    )
+    changed += bool(file_replacements)
+    workers.advance(pending_bytes, files=1)
+    analysis = RolloutAnalysis(
+        1,
+        heads,
+        changed,
+        meta_count,
+        settings_count,
+        malformed,
+        valid,
+        total,
+        0,
+        0,
+        hashes,
+        metadata,
+    )
+    return analysis, files, identities, references
+
+
+def scan_rollouts(
     codex_home: Path,
     source_provider: str,
+    target_provider: str,
     *,
-    allow_paginated: bool = False,
-) -> RolloutAnalysis:
-    files = rollout_paths(codex_home)
-    file_hashes: dict[str, str] = {}
-    file_metadata: dict[str, dict[str, int]] = {}
-    heads = 0
-    files_requiring_changes = 0
-    session_meta_values = 0
-    thread_settings_values = 0
-    malformed_lines = 0
-    valid_lines = 0
-    total_lines = 0
-
-    for path in files:
-        data = path.read_bytes()
-        relative = relative_rollout_path(codex_home, path)
-        file_hashes[relative] = sha256_bytes(data)
-        file_metadata[relative] = capture_file_metadata(path)
-        file_replacements = 0
-        first_session_meta_seen = False
-
-        for line_number, line in enumerate(jsonl_lines(data), 1):
-            total_lines += 1
-            if not line.strip():
-                continue
-            raw_matches = count_raw_provider_matches(line, source_provider)
-            try:
-                record = json.loads(line)
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                malformed_lines += 1
-                if raw_matches or re.search(rb'"history_base"\s*:', line):
-                    raise MigrationError(
-                        "refusing migration metadata inside an unparseable JSONL line at "
-                        f"{path}:{line_number}"
-                    )
-                continue
-
-            valid_lines += 1
-            assert_supported_rollout(
-                record,
-                path,
-                line_number,
-                allow_paginated=allow_paginated,
-            )
-            unknown_paths = walk_provider_values(record, source_provider)
-            if unknown_paths:
-                rendered = ", ".join(".".join(item) for item in unknown_paths)
-                raise MigrationError(
-                    "refusing unknown provider metadata path at "
-                    f"{path}:{line_number}: {rendered}"
-                )
-
-            meta_count, settings_count = structural_provider_changes(
-                record, source_provider
-            )
-            structural_count = meta_count + settings_count
-            if raw_matches != structural_count:
-                raise MigrationError(
-                    "provider byte matches do not map one-to-one to known metadata at "
-                    f"{path}:{line_number} "
-                    f"(raw={raw_matches}, structural={structural_count})"
-                )
-
-            if isinstance(record, dict) and record.get("type") == "session_meta":
-                payload = record.get("payload")
-                if not first_session_meta_seen and isinstance(payload, dict):
-                    first_session_meta_seen = True
-                    if payload.get("model_provider") == source_provider:
-                        heads += 1
-
-            session_meta_values += meta_count
-            thread_settings_values += settings_count
-            file_replacements += structural_count
-
-        if file_replacements:
-            files_requiring_changes += 1
-
-    return RolloutAnalysis(
-        rollout_files=len(files),
-        rollout_heads_from_provider=heads,
-        files_requiring_changes=files_requiring_changes,
-        session_meta_values=session_meta_values,
-        thread_settings_values=thread_settings_values,
-        malformed_lines=malformed_lines,
-        valid_lines=valid_lines,
-        total_lines=total_lines,
-        history_base_values=0,
-        history_base_offsets_changed=0,
-        file_hashes=file_hashes,
-        file_metadata=file_metadata,
+    allow_paginated: bool,
+) -> tuple[
+    RolloutAnalysis,
+    dict[str, FilePlan],
+    dict[str, RolloutIdentity],
+    list[tuple[HistoryBaseReference, ByteEdit]],
+]:
+    paths = rollout_paths(codex_home)
+    hashes = {}
+    metadata = {}
+    files = {}
+    identities = {}
+    references = []
+    counts = [0] * 10
+    jobs = (
+        (codex_home, path, source_provider, target_provider, allow_paginated)
+        for path in paths
     )
+    with (
+        progress.phase(
+            "Scan and validate rollouts",
+            total_files=len(paths),
+            total_bytes=sum(path.stat().st_size for path in paths),
+        ) as status,
+        workers.map_files(scan_rollout_file, jobs, status, processes=True) as results,
+    ):
+        for analysis, found_files, found_identities, found_references in results:
+            if identities.keys() & found_identities.keys():
+                raise MigrationError("ambiguous duplicate rollout ID")
+            for i, field in enumerate(dataclasses.fields(RolloutAnalysis)[:10]):
+                counts[i] += getattr(analysis, field.name)
+            hashes.update(analysis.file_hashes)
+            metadata.update(analysis.file_metadata)
+            files.update(found_files)
+            identities.update(found_identities)
+            references.extend(found_references)
+    # Completion order must not affect plans, manifests, or dependency resolution.
+    analysis = RolloutAnalysis(
+        *counts, dict(sorted(hashes.items())), dict(sorted(metadata.items()))
+    )
+    return (
+        analysis,
+        dict(sorted(files.items())),
+        dict(sorted(identities.items())),
+        sorted(
+            references, key=lambda item: (item[0].relative_path, item[0].line_number)
+        ),
+    )
+
+
+def analyze_rollouts(
+    codex_home: Path, source_provider: str, *, allow_paginated: bool = False
+) -> RolloutAnalysis:
+    return scan_rollouts(
+        codex_home, source_provider, source_provider, allow_paginated=allow_paginated
+    )[0]
 
 
 def ensure_supported_storage(codex_home: Path, sqlite_home: Path) -> None:
@@ -454,7 +569,9 @@ def ensure_supported_storage(codex_home: Path, sqlite_home: Path) -> None:
         raise MigrationError(f"refusing compressed rollout: {sorted(compressed)[0]}")
     history_db = sqlite_home / HISTORY_DB_NAME
     if history_db.is_symlink():
-        raise MigrationError(f"refusing symlinked thread-history database: {history_db}")
+        raise MigrationError(
+            f"refusing symlinked thread-history database: {history_db}"
+        )
     if history_db.exists() and not history_db.is_file():
         raise MigrationError(
             f"thread-history database is not a regular file: {history_db}"
@@ -494,8 +611,10 @@ def read_persistent_sqlite_settings(
     settings: dict[str, int | str] = {}
     for pragma in PERSISTENT_SQLITE_PRAGMAS:
         rows = connection.execute(f"PRAGMA {pragma}").fetchall()
-        if len(rows) != 1 or len(rows[0]) != 1 or not isinstance(
-            rows[0][0], (int, str)
+        if (
+            len(rows) != 1
+            or len(rows[0]) != 1
+            or not isinstance(rows[0][0], (int, str))
         ):
             raise MigrationError(f"cannot read SQLite persistent setting: {pragma}")
         settings[pragma] = rows[0][0]
@@ -537,9 +656,7 @@ def normalize_database_backup_settings(
                 connection.execute(f"PRAGMA {pragma} = {value}")
 
         actual = read_persistent_sqlite_settings(connection)
-        actual["journal_mode"] = connection.execute(
-            "PRAGMA journal_mode"
-        ).fetchone()[0]
+        actual["journal_mode"] = connection.execute("PRAGMA journal_mode").fetchone()[0]
         if actual != expected:
             differing = sorted(
                 name for name in expected if actual.get(name) != expected[name]
@@ -551,6 +668,7 @@ def normalize_database_backup_settings(
         connection.close()
 
 
+@progress.phase("Check state database")
 def analyze_database(db_path: Path, source_provider: str) -> DatabaseAnalysis:
     validate_state_db_path(db_path)
     connection = sqlite3.connect(sqlite_read_only_uri(db_path), uri=True)
@@ -564,9 +682,7 @@ def analyze_database(db_path: Path, source_provider: str) -> DatabaseAnalysis:
             raise MigrationError(
                 f"SQLite foreign_key_check failed: {foreign_key_rows!r}"
             )
-        columns = {
-            row[1] for row in connection.execute('PRAGMA table_info("threads")')
-        }
+        columns = {row[1] for row in connection.execute('PRAGMA table_info("threads")')}
         if "model_provider" not in columns:
             raise MigrationError("threads.model_provider is absent from state database")
         rows = connection.execute(
@@ -601,7 +717,7 @@ def rollout_offset_translation(original: bytes, migrated: bytes) -> dict[int, in
         raise MigrationError("rollout line boundaries changed unexpectedly")
     offsets = {0: 0}
     old_offset = new_offset = 0
-    for old_line, new_line in zip(before, after):
+    for old_line, new_line in zip(before, after, strict=True):
         if old_line.endswith(b"\n") != new_line.endswith(b"\n"):
             raise MigrationError("rollout newline changed unexpectedly")
         old_offset += len(old_line)
@@ -614,14 +730,23 @@ def rollout_offset_translation(original: bytes, migrated: bytes) -> dict[int, in
 # not advance a recovered projection. A later recognized explicit ordinal
 # can establish a new checkpoint without interpreting unknown payload data.
 ROLLOUT_TYPES = {
-    "session_meta", "response_item", "inter_agent_communication",
-    "inter_agent_communication_metadata", "compacted", "turn_context",
-    "token_usage_record", "world_state", "retained_context",
-    "security_risk_score", "realtime_item", "event_msg",
+    "session_meta",
+    "response_item",
+    "inter_agent_communication",
+    "inter_agent_communication_metadata",
+    "compacted",
+    "turn_context",
+    "token_usage_record",
+    "world_state",
+    "retained_context",
+    "security_risk_score",
+    "realtime_item",
+    "event_msg",
 }
 # EventMsg tags, including historical task_* names, from upstream 18344a972d.
 # Count recognized transient events too: older/imported files can contain them.
-KNOWN_EVENT_TYPES = frozenset("""
+KNOWN_EVENT_TYPES = frozenset(
+    """
 agent_message agent_message_content_delta agent_reasoning agent_reasoning_raw_content
 agent_reasoning_section_break apply_patch_approval_request auth_recovery_completed
 auth_recovery_started collab_agent_interaction_begin collab_agent_interaction_end
@@ -644,10 +769,13 @@ task_started terminal_interaction thread_goal_updated thread_queue_changed
 thread_rolled_back thread_settings_applied token_count turn_aborted turn_complete
 turn_diff turn_moderation_metadata turn_started user_message view_image_tool_call
 warning web_search_begin web_search_end
-""".split())
+""".split()
+)
 
 
-def rollout_positions(value: bytes, ordinal_base: int) -> RolloutPositions:
+def rollout_positions(
+    value: bytes | Iterable[bytes], ordinal_base: int, requested: set[int] | None = None
+) -> RolloutPositions:
     """Validate positions using explicit ordinals, independently of byte shifts.
 
     Follow the projection's recovery rules for skipped lines, reused ordinals,
@@ -661,7 +789,7 @@ def rollout_positions(value: bytes, ordinal_base: int) -> RolloutPositions:
     next_ordinal = ordinal_base
     offset = 0
     first_meta = True
-    for line in jsonl_lines(value):
+    for line in jsonl_lines(value) if isinstance(value, bytes) else value:
         if not line.endswith(b"\n"):
             break
         end = offset + len(line)
@@ -691,10 +819,13 @@ def rollout_positions(value: bytes, ordinal_base: int) -> RolloutPositions:
                 and type(ordinal) is int
                 and next_ordinal <= ordinal < 2**63 - 1
             ):
-                starts[offset] = ordinal
-                ends[end] = ordinal
+                if requested is None or offset in requested:
+                    starts[offset] = ordinal
+                if requested is None or end in requested:
+                    ends[end] = ordinal
                 next_ordinal = ordinal + 1
-        checkpoints[end] = next_ordinal
+        if requested is None or end in requested:
+            checkpoints[end] = next_ordinal
         offset = end
     return RolloutPositions(checkpoints, starts, ends)
 
@@ -728,7 +859,9 @@ def index_paginated_rollouts(
         match = canonical.fullmatch(name)
         if match:
             if match["thread"] != thread_id:
-                raise MigrationError(f"rollout filename disagrees with session_meta.id: {relative}")
+                raise MigrationError(
+                    f"rollout filename disagrees with session_meta.id: {relative}"
+                )
             rollout_id = match["rollout"] or match["thread"]
         else:
             # Retain support for older noncanonical single-rollout names. They
@@ -739,10 +872,14 @@ def index_paginated_rollouts(
         if rollout_id in result:
             raise MigrationError(f"ambiguous duplicate rollout ID: {rollout_id}")
         base = payload.get("history_base")
-        ordinal_base = base.get("end_ordinal_exclusive") if isinstance(base, dict) else 0
+        ordinal_base = (
+            base.get("end_ordinal_exclusive") if isinstance(base, dict) else 0
+        )
         if type(ordinal_base) is not int or ordinal_base < 0:
             raise MigrationError(f"invalid rollout ordinal base: {relative}")
-        result[rollout_id] = RolloutIdentity(relative, thread_id, rollout_id, ordinal_base)
+        result[rollout_id] = RolloutIdentity(
+            relative, thread_id, rollout_id, ordinal_base
+        )
     return result
 
 
@@ -894,7 +1031,7 @@ def replace_history_base_offset(
     pattern = re.compile(
         rb'("end_byte_offset"\s*:\s*)'
         + str(reference.original_end_byte_offset).encode("ascii")
-        + rb'(?=\s*[,}])'
+        + rb"(?=\s*[,}])"
     )
     updated, count = pattern.subn(
         lambda match: match.group(1) + str(migrated_offset).encode("ascii"),
@@ -908,6 +1045,62 @@ def replace_history_base_offset(
     return updated
 
 
+def history_position_requests(
+    history_path: Path, *, immutable: bool
+) -> dict[str, set[int]]:
+    """Collect only referenced boundaries; never index every JSONL record in memory."""
+    requests: dict[str, set[int]] = collections.defaultdict(set)
+    if not history_path.is_file():
+        return requests
+    with sqlite3.connect(
+        sqlite_read_only_uri(history_path, immutable=immutable), uri=True
+    ) as db:
+        for table, columns in [
+            ("thread_history_projection_state", ("next_rollout_byte_offset",)),
+            ("thread_turns", ("rollout_byte_offset", "rollout_end_byte_offset")),
+        ]:
+            available = {row[1] for row in db.execute(f"PRAGMA table_info({table})")}
+            if not {"thread_id", *columns}.issubset(available):
+                # The full schema check below supplies the detailed refusal.
+                continue
+            for row in db.execute(
+                f"SELECT thread_id, {', '.join(columns)} FROM {table}"
+            ):
+                for offset in row[1:]:
+                    if type(offset) is int:
+                        requests[row[0]].add(offset)
+    return requests
+
+
+def validate_rollout_boundaries(task):
+    path, rollout_id, ordinal_base, requests, expected_digest = task
+    digest = hashlib.sha256()
+
+    def measured_records():
+        pending = 0
+        for line in records(path):
+            digest.update(line)
+            pending += len(line)
+            if pending >= 1024 * 1024:
+                workers.advance(pending)
+                pending = 0
+            yield line
+        workers.advance(pending)
+
+    measured = measured_records()
+    try:
+        positions = rollout_positions(measured, ordinal_base, requests)
+        # Include any unterminated tail in the complete source digest.
+        for _ in measured:
+            pass
+    finally:
+        measured.close()
+    if digest.hexdigest() != expected_digest:
+        raise MigrationError(f"rollout changed during boundary validation: {path}")
+    workers.advance(files=1)
+    return rollout_id, positions
+
+
 def build_rollout_migration_plan(
     codex_home: Path,
     state_db_path: Path,
@@ -915,162 +1108,97 @@ def build_rollout_migration_plan(
     target_provider: str,
     *,
     immutable: bool = False,
+    allow_paginated: bool | None = None,
 ) -> RolloutMigrationPlan:
-    paths = rollout_paths(codex_home)
-    original_by_relative = {
-        relative_rollout_path(codex_home, path): path.read_bytes() for path in paths
-    }
-    references_by_relative: dict[str, list[HistoryBaseReference]] = {
-        relative: [] for relative in original_by_relative
-    }
-
-    for relative, data in original_by_relative.items():
-        first_session_meta_line: int | None = None
-        for line_number, line in enumerate(jsonl_lines(data), 1):
-            if not line.strip():
-                continue
-            try:
-                record = json.loads(line)
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                continue
-            if (
-                isinstance(record, dict)
-                and record.get("type") == "session_meta"
-                and first_session_meta_line is None
-            ):
-                first_session_meta_line = line_number
-            reference = parse_history_base_reference(
-                record,
-                relative,
-                line_number,
-                first_session_meta_line,
-            )
-            if reference is not None:
-                references_by_relative[relative].append(reference)
-
-    references = [
-        reference
-        for relative_references in references_by_relative.values()
-        for reference in relative_references
-    ]
-    rollouts_by_id = index_paginated_rollouts(original_by_relative)
-    identities_by_relative = {
-        identity.relative_path: identity for identity in rollouts_by_id.values()
-    }
-    dependencies: dict[str, set[str]] = {
-        relative: set() for relative in original_by_relative
-    }
-    for reference in references:
-        owner = identities_by_relative.get(reference.relative_path)
+    history_path = state_db_path.with_name(HISTORY_DB_NAME)
+    if allow_paginated is None:
+        allow_paginated = history_path.is_file()
+    analysis, files, identities, references = scan_rollouts(
+        codex_home,
+        source_provider,
+        target_provider,
+        allow_paginated=allow_paginated,
+    )
+    requests = history_position_requests(history_path, immutable=immutable)
+    dependencies: dict[str, set[str]] = {relative: set() for relative in files}
+    by_relative = {identity.relative_path: identity for identity in identities.values()}
+    references_by_relative: dict[str, list[tuple[HistoryBaseReference, ByteEdit]]] = (
+        collections.defaultdict(list)
+    )
+    for reference, edit in references:
+        owner = by_relative.get(reference.relative_path)
         if owner is None or owner.thread_id != reference.owner_thread_id:
             raise MigrationError("history_base owner has no matching paginated rollout")
-        source = rollouts_by_id.get(reference.source_rollout_id)
+        source = identities.get(reference.source_rollout_id)
         if source is None:
             raise MigrationError("history_base references an unknown source rollout")
         dependencies[reference.relative_path].add(source.relative_path)
+        requests[source.rollout_id].add(reference.original_end_byte_offset)
+        references_by_relative[reference.relative_path].append((reference, edit))
+    try:
+        order = list(graphlib.TopologicalSorter(dependencies).static_order())
+    except graphlib.CycleError as exc:
+        raise MigrationError("cycle detected in history_base references") from exc
 
-    migrated_by_relative: dict[str, bytes] = {}
-    visiting: set[str] = set()
-    migrated_history_bases = 0
-
-    def migrate_relative(relative: str) -> None:
-        nonlocal migrated_history_bases
-        if relative in migrated_by_relative:
-            return
-        if relative in visiting:
-            raise MigrationError("cycle detected in history_base references")
-        visiting.add(relative)
-        for dependency in dependencies[relative]:
-            migrate_relative(dependency)
-
-        identity = identities_by_relative.get(relative)
-        if identity is not None:
-            rollout_positions(original_by_relative[relative], identity.ordinal_base)
-
-        references_by_line = {
-            reference.line_number: reference
-            for reference in references_by_relative[relative]
-        }
-        if len(references_by_line) != len(references_by_relative[relative]):
-            raise MigrationError("multiple history_base records share a JSONL line")
-        migrated_lines: list[bytes] = []
-        for line_number, line in enumerate(
-            jsonl_lines(original_by_relative[relative]), 1
-        ):
-            migrated_line, _ = replace_provider_bytes(
-                line,
-                source_provider,
-                target_provider,
+    positions: dict[str, RolloutPositions] = {}
+    with progress.phase(
+        "Validate paginated boundaries",
+        total_files=len(identities),
+        total_bytes=sum(files[i.relative_path].size for i in identities.values()),
+    ) as status:
+        jobs = (
+            (
+                codex_home / identity.relative_path,
+                rollout_id,
+                identity.ordinal_base,
+                requests[rollout_id],
+                files[identity.relative_path].digest,
             )
-            reference = references_by_line.get(line_number)
-            if reference is not None:
-                source = rollouts_by_id[reference.source_rollout_id]
-                source_relative = source.relative_path
-                original_source = original_by_relative[source_relative]
-                positions = rollout_positions(original_source, source.ordinal_base)
-                actual_ordinal = positions.checkpoints.get(reference.original_end_byte_offset)
-                if (
-                    reference.end_ordinal_exclusive <= source.ordinal_base
-                    or actual_ordinal != reference.end_ordinal_exclusive
-                ):
-                    raise MigrationError(
-                        "history_base offset is not on its recorded source boundary at "
-                        f"{reference.relative_path}:{reference.line_number}"
-                    )
-                migrated_offset = rollout_offset_translation(
-                    original_source, migrated_by_relative[source_relative]
-                )[reference.original_end_byte_offset]
-                migrated_line = replace_history_base_offset(
-                    migrated_line,
-                    reference,
-                    migrated_offset,
-                )
-                try:
-                    migrated_record = json.loads(migrated_line)
-                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-                    raise MigrationError(
-                        "history_base rewrite produced invalid JSON at "
-                        f"{reference.relative_path}:{reference.line_number}"
-                    ) from exc
-                migrated_payload = (
-                    migrated_record.get("payload")
-                    if isinstance(migrated_record, dict)
-                    else None
-                )
-                migrated_history_base = (
-                    migrated_payload.get("history_base")
-                    if isinstance(migrated_payload, dict)
-                    else None
-                )
-                if (
-                    not isinstance(migrated_history_base, dict)
-                    or migrated_history_base.get("end_byte_offset")
-                    != migrated_offset
-                ):
-                    raise MigrationError(
-                        "history_base rewrite did not preserve parsed metadata at "
-                        f"{reference.relative_path}:{reference.line_number}"
-                    )
-                if migrated_offset != reference.original_end_byte_offset:
-                    migrated_history_bases += 1
-            migrated_lines.append(migrated_line)
-        migrated = b"".join(migrated_lines)
-        if len(jsonl_lines(migrated)) != len(
-            jsonl_lines(original_by_relative[relative])
-        ):
-            raise MigrationError(
-                f"rollout line boundaries changed unexpectedly: {relative}"
-            )
-        migrated_by_relative[relative] = migrated
-        visiting.remove(relative)
+            for rollout_id, identity in identities.items()
+        )
+        with workers.map_files(
+            validate_rollout_boundaries, jobs, status, processes=True
+        ) as results:
+            positions.update(results)
+    positions = dict(sorted(positions.items()))
 
-    for relative in original_by_relative:
-        migrate_relative(relative)
-    return RolloutMigrationPlan(
-        migrated_bytes=migrated_by_relative,
+    base_changes = 0
+    for relative in order:
+        extra = []
+        for reference, edit in references_by_relative[relative]:
+            source = identities[reference.source_rollout_id]
+            if (
+                reference.end_ordinal_exclusive <= source.ordinal_base
+                or positions[source.rollout_id].checkpoints.get(
+                    reference.original_end_byte_offset
+                )
+                != reference.end_ordinal_exclusive
+            ):
+                raise MigrationError(
+                    "history_base offset is not on its recorded source boundary at "
+                    f"{relative}:{reference.line_number}"
+                )
+            migrated = files[source.relative_path].translate(
+                reference.original_end_byte_offset
+            )
+            if migrated != reference.original_end_byte_offset:
+                extra.append(
+                    dataclasses.replace(edit, after=str(migrated).encode("ascii"))
+                )
+                base_changes += 1
+        if extra:
+            file = files[relative]
+            files[relative] = dataclasses.replace(
+                file, edits=tuple(sorted((*file.edits, *extra), key=lambda e: e.offset))
+            )
+    analysis = dataclasses.replace(
+        analysis,
+        files_requiring_changes=sum(bool(f.edits) for f in files.values()),
         history_base_values=len(references),
-        history_base_offsets_changed=migrated_history_bases,
-        rollouts_by_id=rollouts_by_id,
+        history_base_offsets_changed=base_changes,
+    )
+    return RolloutMigrationPlan(
+        files, positions, analysis, len(references), base_changes, identities
     )
 
 
@@ -1083,38 +1211,22 @@ def analyze_migratable_rollouts(
     allow_paginated: bool,
     immutable: bool = False,
 ) -> tuple[RolloutAnalysis, RolloutMigrationPlan]:
-    analysis = analyze_rollouts(
-        codex_home,
-        source_provider,
-        allow_paginated=allow_paginated,
-    )
     plan = build_rollout_migration_plan(
         codex_home,
         state_db_path,
         source_provider,
         target_provider,
         immutable=immutable,
+        allow_paginated=allow_paginated,
     )
-    files_requiring_changes = 0
-    for path in rollout_paths(codex_home):
-        relative = relative_rollout_path(codex_home, path)
-        if path.read_bytes() != plan.migrated_bytes[relative]:
-            files_requiring_changes += 1
-    return (
-        dataclasses.replace(
-            analysis,
-            files_requiring_changes=files_requiring_changes,
-            history_base_values=plan.history_base_values,
-            history_base_offsets_changed=plan.history_base_offsets_changed,
-        ),
-        plan,
-    )
+    return plan.analysis, plan
 
 
 def quoted_identifier(value: str) -> str:
     return '"' + value.replace('"', '""') + '"'
 
 
+@progress.phase("Check history database")
 def inspect_history_database(
     history_db_path: Path,
     state_db_path: Path,
@@ -1123,6 +1235,7 @@ def inspect_history_database(
     target_provider: str,
     *,
     immutable: bool = False,
+    rollout_migration: RolloutMigrationPlan | None = None,
 ) -> tuple[HistoryDatabaseAnalysis, list[HistoryOffsetUpdate]]:
     if not history_db_path.exists():
         return (
@@ -1142,13 +1255,14 @@ def inspect_history_database(
             f"thread-history database is missing or unsafe: {history_db_path}"
         )
     validate_state_db_path(state_db_path)
-    rollout_migration = build_rollout_migration_plan(
-        codex_home,
-        state_db_path,
-        source_provider,
-        target_provider,
-        immutable=immutable,
-    )
+    if rollout_migration is None:
+        rollout_migration = build_rollout_migration_plan(
+            codex_home,
+            state_db_path,
+            source_provider,
+            target_provider,
+            immutable=immutable,
+        )
 
     history = sqlite3.connect(
         sqlite_read_only_uri(history_db_path, immutable=immutable), uri=True
@@ -1239,9 +1353,7 @@ def inspect_history_database(
         }
         expected_state_columns = {"id", "rollout_path", "history_mode"}
         if not expected_state_columns.issubset(state_columns):
-            raise MigrationError(
-                "state database lacks paginated thread path metadata"
-            )
+            raise MigrationError("state database lacks paginated thread path metadata")
         state_threads = {
             row[0]: (row[1], row[2])
             for row in state.execute(
@@ -1249,8 +1361,7 @@ def inspect_history_database(
             )
         }
         paginated_threads = sum(
-            history_mode == "paginated"
-            for _, history_mode in state_threads.values()
+            history_mode == "paginated" for _, history_mode in state_threads.values()
         )
 
         # State rows select the current physical file of a logical thread.
@@ -1264,7 +1375,9 @@ def inspect_history_database(
             selected = resolve_recorded_rollout_path(codex_home, recorded_path)
             identity = by_relative.get(relative_rollout_path(codex_home, selected))
             if identity is None or identity.thread_id != thread_id:
-                raise MigrationError("paginated rollout metadata does not match its state thread")
+                raise MigrationError(
+                    "paginated rollout metadata does not match its state thread"
+                )
 
         referenced_rollouts: set[str] = set()
         for table, columns in columns_by_table.items():
@@ -1281,8 +1394,6 @@ def inspect_history_database(
                     "thread-history database references an unknown paginated rollout"
                 )
 
-        translation_cache: dict[str, tuple[RolloutPositions, dict[int, int]]] = {}
-
         def translate(
             rollout_id: str,
             offset: Any,
@@ -1295,23 +1406,16 @@ def inspect_history_database(
                 raise MigrationError(f"invalid thread-history offset pair: {label}")
             identity = identities.get(rollout_id)
             if identity is None:
-                raise MigrationError(f"thread-history offset has no paginated rollout: {label}")
-            cached = translation_cache.get(rollout_id)
-            if cached is None:
-                data = (codex_home / identity.relative_path).read_bytes()
-                migrated_data = rollout_migration.migrated_bytes[identity.relative_path]
-                cached = (
-                    rollout_positions(data, identity.ordinal_base),
-                    rollout_offset_translation(data, migrated_data),
+                raise MigrationError(
+                    f"thread-history offset has no paginated rollout: {label}"
                 )
-                translation_cache[rollout_id] = cached
-            positions, offsets = cached
+            positions = rollout_migration.positions[rollout_id]
             boundaries = getattr(positions, position)
             if boundaries.get(offset) != ordinal or offset not in boundaries:
                 raise MigrationError(
                     f"thread-history offset is not on its recorded JSONL boundary: {label}"
                 )
-            return offsets[offset]
+            return rollout_migration.files[identity.relative_path].translate(offset)
 
         updates: list[HistoryOffsetUpdate] = []
         for thread_id, offset, ordinal in history.execute(
@@ -1460,6 +1564,7 @@ def require_writable_database(db_path: Path, *, label: str = "state database") -
         connection.close()
 
 
+@progress.phase("Update history offsets")
 def apply_history_offset_updates(
     history_db_path: Path,
     updates: list[HistoryOffsetUpdate],
@@ -1486,8 +1591,7 @@ def apply_history_offset_updates(
                 connection.rollback()
                 raise MigrationError("invalid thread-history offset update plan")
             where = " AND ".join(
-                f"{quoted_identifier(column)} = ?"
-                for column in update.key_columns
+                f"{quoted_identifier(column)} = ?" for column in update.key_columns
             )
             sql = (
                 f"UPDATE {quoted_identifier(update.table)} "
@@ -1568,9 +1672,7 @@ def validate_config_profiles(codex_home: Path, before: bytes, after: bytes) -> N
                 )
 
 
-def transform_config(
-    raw: bytes, source_provider: str, target_provider: str
-) -> bytes:
+def transform_config(raw: bytes, source_provider: str, target_provider: str) -> bytes:
     if target_provider != "openai":
         raise MigrationError(
             "automatic config migration only supports target provider 'openai'"
@@ -1581,9 +1683,13 @@ def transform_config(
     except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
         raise MigrationError(f"cannot parse config.toml: {exc}") from exc
 
-    if parsed.get("model_provider") != source_provider:
+    selected_provider = parsed.get("model_provider", "openai")
+    if selected_provider == target_provider:
+        return raw
+    if selected_provider != source_provider:
         raise MigrationError(
-            f"config.toml does not select model_provider={source_provider!r}"
+            f"config.toml does not select model_provider={source_provider!r}; "
+            f"it selects {selected_provider!r}. Omit --migrate-config to migrate only sessions"
         )
     providers = parsed.get("model_providers")
     if not isinstance(providers, dict) or not isinstance(
@@ -1677,6 +1783,20 @@ def transform_config(
     return updated
 
 
+def plan_config_migration(
+    codex_home: Path, original: bytes, source_provider: str, target_provider: str
+) -> bytes | None:
+    transformed = transform_config(original, source_provider, target_provider)
+    if transformed == original:
+        progress.warning(
+            f"config.toml already uses model_provider={target_provider!r} "
+            "(explicitly or by default); skipping config migration"
+        )
+        return None
+    validate_config_profiles(codex_home, original, transformed)
+    return transformed
+
+
 def set_file_owner(path: Path, uid: int, gid: int) -> None:
     chown = getattr(os, "chown", None)
     if chown is None:
@@ -1690,7 +1810,7 @@ def set_file_owner(path: Path, uid: int, gid: int) -> None:
 
 def atomic_write(
     path: Path,
-    value: bytes,
+    value: bytes | Iterable[bytes],
     *,
     preserve_mtime: bool,
 ) -> None:
@@ -1699,9 +1819,11 @@ def atomic_write(
         prefix=f".{path.name}.provider-migration-", dir=path.parent
     )
     temporary = Path(temporary_name)
+    chunks = iter((value,) if isinstance(value, bytes) else value)
     try:
         with os.fdopen(fd, "wb") as stream:
-            stream.write(value)
+            for chunk in chunks:
+                stream.write(chunk)
             stream.flush()
             os.fsync(stream.fileno())
         set_file_owner(temporary, metadata.st_uid, metadata.st_gid)
@@ -1713,6 +1835,9 @@ def atomic_write(
             )
         os.replace(temporary, path)
     finally:
+        close = getattr(chunks, "close", None)
+        if close is not None:
+            close()
         temporary.unlink(missing_ok=True)
 
 
@@ -1729,8 +1854,7 @@ def command_looks_like_codex(command_args: list[str]) -> bool:
     # A generic argument named `codex` may instead be a bind-mount destination or
     # the value of --codex-home in a Docker invocation.
     return any(
-        argument.rsplit("/", 1)[-1] == "codex.js"
-        or "/@openai/codex/" in argument
+        argument.rsplit("/", 1)[-1] == "codex.js" or "/@openai/codex/" in argument
         for argument in normalized[1:]
     )
 
@@ -1797,7 +1921,17 @@ def copy_database_backup(
     )
     destination_connection = sqlite3.connect(destination)
     try:
-        source_connection.backup(destination_connection)
+        page_size = source_connection.execute("PRAGMA page_size").fetchone()[0]
+        pages = source_connection.execute("PRAGMA page_count").fetchone()[0]
+        with progress.phase(
+            "Copy SQLite backup", total_bytes=pages * page_size
+        ) as status:
+
+            def update(_result, remaining, total):
+                status.total_bytes = total * page_size
+                status.completed_bytes = (total - remaining) * page_size
+
+            source_connection.backup(destination_connection, pages=256, progress=update)
     finally:
         destination_connection.close()
         source_connection.close()
@@ -1812,6 +1946,7 @@ def write_json_atomic(path: Path, value: dict[str, Any]) -> None:
     os.chmod(path, 0o600)
 
 
+@progress.phase("Create backup")
 def create_backup(
     *,
     codex_home: Path,
@@ -1842,15 +1977,62 @@ def create_backup(
         config_artifact = artifact_descriptor(config_backup, config_metadata)
     elif config_path.exists():
         raise MigrationError(f"config path is not a regular file: {config_path}")
-    for name in SESSION_DIR_NAMES:
-        source = codex_home / name
-        if source.is_dir():
-            shutil.copytree(
-                source,
-                backup_dir / name,
-                copy_function=shutil.copy2,
-                symlinks=True,
+    copy_paths = [
+        path
+        for root in session_roots(codex_home)
+        for path in root.rglob("*")
+        if path.is_file()
+    ]
+    with progress.phase(
+        "Copy session backup",
+        total_files=len(copy_paths),
+        total_bytes=sum(path.stat().st_size for path in copy_paths),
+    ) as status:
+        copy_jobs = []
+
+        def queue_copy(source, destination):
+            copy_jobs.append((Path(source), Path(destination)))
+            return destination
+
+        for name in SESSION_DIR_NAMES:
+            source = codex_home / name
+            if source.is_dir():
+                shutil.copytree(
+                    source,
+                    backup_dir / name,
+                    copy_function=queue_copy,
+                    symlinks=True,
+                )
+
+        directories = [
+            directory
+            for root in session_roots(codex_home)
+            for directory in (
+                root,
+                *(p for p in root.rglob("*") if p.is_dir() and not p.is_symlink()),
             )
+        ]
+        # copytree applies directory modes before deferred copies run. Keep the
+        # private destinations writable until their files have been created.
+        for directory in directories:
+            destination = backup_dir / directory.relative_to(codex_home)
+            if destination.is_symlink():
+                raise MigrationError(
+                    f"refusing symlinked backup directory: {destination}"
+                )
+            destination.chmod(stat.S_IMODE(destination.stat().st_mode) | stat.S_IRWXU)
+
+        def copy_file(job):
+            source, destination = job
+            workers.check_cancelled()
+            shutil.copy2(source, destination)
+            workers.advance(source.stat().st_size, files=1)
+
+        workers.for_each(copy_file, copy_jobs, status)
+        # File creation changes directory mtimes after copytree copied them.
+        for directory in reversed(directories):
+            shutil.copystat(directory, backup_dir / directory.relative_to(codex_home))
+
     database_metadata = capture_file_metadata(db_path)
     database_backup = backup_dir / db_path.name
     copy_database_backup(db_path, database_backup)
@@ -1875,7 +2057,8 @@ def create_backup(
             history_database_metadata,
         )
 
-    for relative, expected_hash in rollout_analysis.file_hashes.items():
+    def check_copied_rollout(item):
+        relative, expected_hash = item
         copied = backup_dir / relative
         expected_metadata = rollout_analysis.file_metadata[relative]
         if copied.is_file():
@@ -1884,6 +2067,19 @@ def create_backup(
             raise MigrationError(f"backup hash mismatch for {relative}")
         if capture_file_metadata(copied) != expected_metadata:
             raise MigrationError(f"backup metadata mismatch for {relative}")
+        workers.advance(copied.stat().st_size, files=1)
+
+    with progress.phase(
+        "Verify session backup",
+        total_files=len(rollout_analysis.file_hashes),
+        total_bytes=sum(
+            (backup_dir / relative).stat().st_size
+            for relative in rollout_analysis.file_hashes
+        ),
+    ) as status:
+        workers.for_each(
+            check_copied_rollout, rollout_analysis.file_hashes.items(), status
+        )
 
     manifest: dict[str, Any] = {
         "manifest_version": MANIFEST_VERSION,
@@ -1898,9 +2094,7 @@ def create_backup(
         "migrate_config": migrate_config,
         "rollout_analysis": dataclasses.asdict(rollout_analysis),
         "database_analysis": dataclasses.asdict(database_analysis),
-        "history_database_analysis": dataclasses.asdict(
-            history_database_analysis
-        ),
+        "history_database_analysis": dataclasses.asdict(history_database_analysis),
         "artifacts": {
             "config": config_artifact,
             "database": database_artifact,
@@ -1911,6 +2105,35 @@ def create_backup(
     return manifest
 
 
+def compare_table_rows(
+    original: sqlite3.Connection,
+    migrated: sqlite3.Connection,
+    table: str,
+    columns: list[str],
+    expressions: list[str],
+    parameters: tuple[Any, ...] = (),
+) -> int:
+    # Order by every transformed value with binary collation, retaining duplicate multiplicity.
+    # Using PK-only ordering would miss schemas with nullable/non-unique logical keys.
+    order = ", ".join(
+        quoted_identifier(column) + " COLLATE BINARY" for column in columns
+    )
+    table_name = quoted_identifier(table)
+    before = original.execute(
+        f"SELECT {', '.join(expressions)} FROM {table_name} ORDER BY {order}",
+        parameters,
+    )
+    after = migrated.execute(f"SELECT * FROM {table_name} ORDER BY {order}")
+    sentinel = object()
+    count = 0
+    for expected, actual in itertools.zip_longest(before, after, fillvalue=sentinel):
+        if expected != actual:
+            raise MigrationError(f"unexpected SQLite change in table {table}")
+        count += 1
+    return count
+
+
+@progress.phase("Verify state database")
 def compare_sqlite_databases(
     original_path: Path,
     migrated_path: Path,
@@ -1928,6 +2151,9 @@ def compare_sqlite_databases(
     rows_checked = 0
     changed_rows = 0
     try:
+        for connection in (original, migrated):
+            connection.execute("PRAGMA temp_store = FILE")
+            connection.execute("PRAGMA cache_size = -8192")
         original.execute("BEGIN")
         migrated.execute("BEGIN")
         if original.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
@@ -1952,17 +2178,18 @@ def compare_sqlite_databases(
             ):
                 continue
             raise MigrationError(f"SQLite persistent setting changed: {pragma}")
-        if sqlite_header_journal_mode(
-            original_path
-        ) != sqlite_header_journal_mode(migrated_path):
+        if sqlite_header_journal_mode(original_path) != sqlite_header_journal_mode(
+            migrated_path
+        ):
             raise MigrationError("SQLite persistent setting changed: journal_mode")
 
         schema_query = (
             "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name"
         )
-        if original.execute(schema_query).fetchall() != migrated.execute(
-            schema_query
-        ).fetchall():
+        if (
+            original.execute(schema_query).fetchall()
+            != migrated.execute(schema_query).fetchall()
+        ):
             raise MigrationError("SQLite schema changed")
         tables = [
             row[0]
@@ -1982,31 +2209,32 @@ def compare_sqlite_databases(
         for table in tables:
             quoted = '"' + table.replace('"', '""') + '"'
             columns = [
-                row[1]
-                for row in original.execute(f"PRAGMA table_info({quoted})")
+                row[1] for row in original.execute(f"PRAGMA table_info({quoted})")
             ]
-            original_rows = original.execute(f"SELECT * FROM {quoted}").fetchall()
-            migrated_rows = migrated.execute(f"SELECT * FROM {quoted}").fetchall()
-            expected_rows = original_rows
+            expressions = [quoted_identifier(column) for column in columns]
+            parameters: tuple[Any, ...] = ()
             if table == "threads":
-                provider_index = columns.index("model_provider")
-                expected_rows = []
-                for row in original_rows:
-                    expected = list(row)
-                    if expected[provider_index] == source_provider:
-                        expected[provider_index] = target_provider
-                        changed_rows += 1
-                    expected_rows.append(tuple(expected))
-            if collections.Counter(expected_rows) != collections.Counter(migrated_rows):
-                raise MigrationError(f"unexpected SQLite change in table {table}")
+                index = columns.index("model_provider")
+                expressions[index] = (
+                    'CASE WHEN "model_provider" = ? THEN ? ELSE "model_provider" END AS "model_provider"'
+                )
+                parameters = (source_provider, target_provider)
+                changed_rows += original.execute(
+                    "SELECT count(*) FROM threads WHERE model_provider = ?",
+                    (source_provider,),
+                ).fetchone()[0]
+            rows_checked += compare_table_rows(
+                original, migrated, table, columns, expressions, parameters
+            )
             tables_checked += 1
-            rows_checked += len(original_rows)
+
     finally:
         original.close()
         migrated.close()
     return tables_checked, rows_checked, changed_rows
 
 
+@progress.phase("Verify history database")
 def compare_history_databases(
     original_path: Path,
     migrated_path: Path,
@@ -2016,6 +2244,7 @@ def compare_history_databases(
     target_provider: str,
     *,
     allow_restore_intermediate: bool = False,
+    rollout_migration: RolloutMigrationPlan | None = None,
 ) -> tuple[int, int, int]:
     analysis, updates = inspect_history_database(
         original_path,
@@ -2024,6 +2253,7 @@ def compare_history_databases(
         source_provider,
         target_provider,
         immutable=True,
+        rollout_migration=rollout_migration,
     )
     if not analysis.present:
         raise MigrationError("backup thread-history database is missing")
@@ -2035,6 +2265,9 @@ def compare_history_databases(
     tables_checked = 0
     rows_checked = 0
     try:
+        for connection in (original, migrated):
+            connection.execute("PRAGMA temp_store = FILE")
+            connection.execute("PRAGMA cache_size = -8192")
         original.execute("BEGIN")
         migrated.execute("BEGIN")
         if original.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
@@ -2058,9 +2291,7 @@ def compare_history_databases(
                 and migrated_settings[pragma] == original_settings[pragma] + 1
             ):
                 continue
-            raise MigrationError(
-                f"thread-history persistent setting changed: {pragma}"
-            )
+            raise MigrationError(f"thread-history persistent setting changed: {pragma}")
         if sqlite_header_journal_mode(original_path) != sqlite_header_journal_mode(
             migrated_path
         ):
@@ -2071,9 +2302,10 @@ def compare_history_databases(
         schema_query = (
             "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name"
         )
-        if original.execute(schema_query).fetchall() != migrated.execute(
-            schema_query
-        ).fetchall():
+        if (
+            original.execute(schema_query).fetchall()
+            != migrated.execute(schema_query).fetchall()
+        ):
             raise MigrationError("thread-history SQLite schema changed")
         tables = [
             row[0]
@@ -2104,44 +2336,42 @@ def compare_history_databases(
             columns = [
                 row[1] for row in original.execute(f"PRAGMA table_info({quoted})")
             ]
-            original_rows = original.execute(f"SELECT * FROM {quoted}").fetchall()
-            migrated_rows = migrated.execute(f"SELECT * FROM {quoted}").fetchall()
-            expected_rows: list[tuple[Any, ...]] = []
+            expressions = [quoted_identifier(column) for column in columns]
             if table == "thread_history_projection_state":
                 key_columns = ("thread_id",)
                 offset_columns = ("next_rollout_byte_offset",)
             elif table == "thread_turns":
                 key_columns = ("thread_id", "turn_id")
-                offset_columns = (
-                    "rollout_byte_offset",
-                    "rollout_end_byte_offset",
-                )
+                offset_columns = ("rollout_byte_offset", "rollout_end_byte_offset")
             else:
-                key_columns = ()
-                offset_columns = ()
+                key_columns = offset_columns = ()
+            for column in offset_columns:
 
-            for row in original_rows:
-                expected = list(row)
-                key_values = tuple(row[columns.index(key)] for key in key_columns)
-                for offset_column in offset_columns:
-                    index = columns.index(offset_column)
-                    locator = (
-                        table,
-                        key_values,
-                        offset_column,
-                        row[index],
+                def expected_offset(*args, table=table, column=column):
+                    return planned.get(
+                        (table, tuple(args[:-1]), column, args[-1]), args[-1]
                     )
-                    if locator in planned:
-                        expected[index] = planned[locator]
-                expected_rows.append(tuple(expected))
-            if collections.Counter(expected_rows) != collections.Counter(
-                migrated_rows
-            ):
+
+                function = "expected_" + column
+                original.create_function(
+                    function, len(key_columns) + 1, expected_offset, deterministic=True
+                )
+                arguments = ", ".join(
+                    quoted_identifier(key) for key in (*key_columns, column)
+                )
+                expressions[columns.index(column)] = (
+                    f"{function}({arguments}) AS {quoted_identifier(column)}"
+                )
+            try:
+                rows_checked += compare_table_rows(
+                    original, migrated, table, columns, expressions
+                )
+            except MigrationError as exc:
                 raise MigrationError(
                     f"unexpected thread-history SQLite change in table {table}"
-                )
+                ) from exc
             tables_checked += 1
-            rows_checked += len(original_rows)
+
     finally:
         original.close()
         migrated.close()
@@ -2165,9 +2395,7 @@ def load_backup_manifest(backup_dir: Path) -> dict[str, Any]:
     }
     missing = sorted(required_string_fields - manifest.keys())
     if missing:
-        raise MigrationError(
-            "invalid backup manifest: missing " + ", ".join(missing)
-        )
+        raise MigrationError("invalid backup manifest: missing " + ", ".join(missing))
     invalid_strings = sorted(
         name
         for name in required_string_fields
@@ -2237,6 +2465,7 @@ def validate_sha256(value: Any, label: str) -> str:
     return value
 
 
+@progress.phase("Validate backup artifacts")
 def validate_backup_artifacts(
     backup_dir: Path,
     manifest: dict[str, Any],
@@ -2246,9 +2475,7 @@ def validate_backup_artifacts(
         raise MigrationError("invalid backup manifest rollout analysis")
     expected_hashes = rollout_analysis.get("file_hashes")
     expected_metadata = rollout_analysis.get("file_metadata")
-    if not isinstance(expected_hashes, dict) or not isinstance(
-        expected_metadata, dict
-    ):
+    if not isinstance(expected_hashes, dict) or not isinstance(expected_metadata, dict):
         raise MigrationError("invalid backup manifest rollout artifacts")
 
     backup_rollouts = {
@@ -2259,7 +2486,9 @@ def validate_backup_artifacts(
         backup_rollouts
     ):
         raise MigrationError("backup rollout file set differs from the manifest")
-    for relative, path in backup_rollouts.items():
+
+    def validate_rollout(item):
+        relative, path = item
         expected_hash = validate_sha256(
             expected_hashes[relative], f"rollout {relative}"
         )
@@ -2270,6 +2499,14 @@ def validate_backup_artifacts(
             raise MigrationError(f"backup rollout digest mismatch: {relative}")
         if capture_file_metadata(path) != metadata:
             raise MigrationError(f"backup rollout metadata mismatch: {relative}")
+        workers.advance(path.stat().st_size, files=1)
+
+    with progress.phase(
+        "Validate backup rollouts",
+        total_files=len(backup_rollouts),
+        total_bytes=sum(path.stat().st_size for path in backup_rollouts.values()),
+    ) as status:
+        workers.for_each(validate_rollout, backup_rollouts.items(), status)
 
     artifacts = manifest.get("artifacts")
     expected_artifacts = {"config", "database"}
@@ -2279,9 +2516,10 @@ def validate_backup_artifacts(
         raise MigrationError("invalid backup manifest artifacts")
 
     config_descriptor = artifacts["config"]
-    if not isinstance(config_descriptor, dict) or type(
-        config_descriptor.get("present")
-    ) is not bool:
+    if (
+        not isinstance(config_descriptor, dict)
+        or type(config_descriptor.get("present")) is not bool
+    ):
         raise MigrationError("invalid backup manifest config artifact")
     config_path = backup_dir / "config.toml"
     if config_descriptor["present"]:
@@ -2294,9 +2532,7 @@ def validate_backup_artifacts(
             },
             "config.toml",
         )
-        config_hash = validate_sha256(
-            config_descriptor.get("sha256"), "config.toml"
-        )
+        config_hash = validate_sha256(config_descriptor.get("sha256"), "config.toml")
         if sha256_file(config_path) != config_hash:
             raise MigrationError("backup config.toml digest mismatch")
         if capture_file_metadata(config_path) != config_metadata:
@@ -2305,9 +2541,10 @@ def validate_backup_artifacts(
         raise MigrationError("unexpected config.toml exists in backup")
 
     database_descriptor = artifacts["database"]
-    if not isinstance(database_descriptor, dict) or database_descriptor.get(
-        "present"
-    ) is not True:
+    if (
+        not isinstance(database_descriptor, dict)
+        or database_descriptor.get("present") is not True
+    ):
         raise MigrationError("invalid backup manifest database artifact")
     database_path = backup_dir / manifest["state_db_name"]
     if database_path.is_symlink() or not database_path.is_file():
@@ -2336,9 +2573,7 @@ def validate_backup_artifacts(
     history_path = backup_dir / HISTORY_DB_NAME
     if history_descriptor["present"]:
         if history_path.is_symlink() or not history_path.is_file():
-            raise MigrationError(
-                "backup thread-history database is missing or unsafe"
-            )
+            raise MigrationError("backup thread-history database is missing or unsafe")
         history_metadata = validate_recorded_metadata(
             {
                 key: history_descriptor.get(key)
@@ -2409,148 +2644,41 @@ def verify_against_backup(
         allow_paginated=history_descriptor["present"],
         immutable=True,
     )
-    changed_files = 0
-    unchanged_files = 0
-    malformed_preserved = 0
-    lines_checked = 0
-    session_meta_changed = 0
-    thread_settings_changed = 0
-    history_base_changed = 0
+    changed_files = backup_analysis.files_requiring_changes
+    unchanged_files = backup_analysis.rollout_files - changed_files
+    malformed_preserved = backup_analysis.malformed_lines
+    lines_checked = backup_analysis.total_lines
+    session_meta_changed = backup_analysis.session_meta_values
+    thread_settings_changed = backup_analysis.thread_settings_values
+    history_base_changed = backup_analysis.history_base_offsets_changed
+    with progress.phase(
+        "Verify rollout bytes and metadata",
+        total_files=len(original_by_relative),
+        total_bytes=sum(f.size for f in backup_rollout_migration.files.values()),
+    ) as status:
 
-    for relative in sorted(original_by_relative):
-        original_path = original_by_relative[relative]
-        migrated_path = migrated_by_relative[relative]
-        original = original_path.read_bytes()
-        migrated = migrated_path.read_bytes()
-        expected = backup_rollout_migration.migrated_bytes[relative]
-        if migrated != expected:
-            raise MigrationError(f"unexpected rollout byte change: {relative}")
-        if original != expected:
-            changed_files += 1
-        else:
-            unchanged_files += 1
+        def verify_rollout(relative):
+            original_path = original_by_relative[relative]
+            migrated_path = migrated_by_relative[relative]
+            file = backup_rollout_migration.files[relative]
+            if not matches_chunks(migrated_path, file.chunks(original_path)):
+                raise MigrationError(f"unexpected rollout byte change: {relative}")
+            original_stat = original_path.stat()
+            migrated_stat = migrated_path.stat()
+            if stat.S_IMODE(original_stat.st_mode) != stat.S_IMODE(
+                migrated_stat.st_mode
+            ):
+                raise MigrationError(f"rollout mode changed: {relative}")
+            if (original_stat.st_uid, original_stat.st_gid) != (
+                migrated_stat.st_uid,
+                migrated_stat.st_gid,
+            ):
+                raise MigrationError(f"rollout ownership changed: {relative}")
+            if original_stat.st_mtime_ns != migrated_stat.st_mtime_ns:
+                raise MigrationError(f"rollout mtime changed: {relative}")
+            workers.advance(file.size, files=1)
 
-        original_stat = original_path.stat()
-        migrated_stat = migrated_path.stat()
-        if stat.S_IMODE(original_stat.st_mode) != stat.S_IMODE(migrated_stat.st_mode):
-            raise MigrationError(f"rollout mode changed: {relative}")
-        if (original_stat.st_uid, original_stat.st_gid) != (
-            migrated_stat.st_uid,
-            migrated_stat.st_gid,
-        ):
-            raise MigrationError(f"rollout ownership changed: {relative}")
-        if original_stat.st_mtime_ns != migrated_stat.st_mtime_ns:
-            raise MigrationError(f"rollout mtime changed: {relative}")
-
-        original_lines = jsonl_lines(original)
-        migrated_lines = jsonl_lines(migrated)
-        expected_lines = jsonl_lines(expected)
-        if not (
-            len(original_lines) == len(migrated_lines) == len(expected_lines)
-        ):
-            raise MigrationError(f"rollout line count changed: {relative}")
-        for line_number, (before, after, expected_line) in enumerate(
-            zip(original_lines, migrated_lines, expected_lines), 1
-        ):
-            lines_checked += 1
-            if not before.strip():
-                if before != after:
-                    raise MigrationError(
-                        f"blank line changed: {relative}:{line_number}"
-                    )
-                continue
-            try:
-                before_record = json.loads(before)
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                if before != after:
-                    raise MigrationError(
-                        f"malformed line changed: {relative}:{line_number}"
-                    )
-                malformed_preserved += 1
-                continue
-            try:
-                after_record = json.loads(after)
-            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-                raise MigrationError(
-                    f"valid line became invalid: {relative}:{line_number}"
-                ) from exc
-            try:
-                expected_record = json.loads(expected_line)
-            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-                raise MigrationError(
-                    f"planned line is invalid: {relative}:{line_number}"
-                ) from exc
-            payload = (
-                before_record.get("payload")
-                if isinstance(before_record, dict)
-                else None
-            )
-            if isinstance(payload, dict):
-                if (
-                    before_record.get("type") == "session_meta"
-                    and payload.get("model_provider") == source_provider
-                ):
-                    payload["model_provider"] = target_provider
-                    session_meta_changed += 1
-                settings = payload.get("thread_settings")
-                if (
-                    before_record.get("type") == "event_msg"
-                    and payload.get("type") == "thread_settings_applied"
-                    and isinstance(settings, dict)
-                    and settings.get("model_provider_id") == source_provider
-                ):
-                    settings["model_provider_id"] = target_provider
-                    thread_settings_changed += 1
-                before_history_base = payload.get("history_base")
-                expected_payload = (
-                    expected_record.get("payload")
-                    if isinstance(expected_record, dict)
-                    else None
-                )
-                expected_history_base = (
-                    expected_payload.get("history_base")
-                    if isinstance(expected_payload, dict)
-                    else None
-                )
-                if (
-                    isinstance(before_history_base, dict)
-                    and isinstance(expected_history_base, dict)
-                    and before_history_base.get("end_byte_offset")
-                    != expected_history_base.get("end_byte_offset")
-                ):
-                    history_base_changed += 1
-            if after_record != expected_record:
-                raise MigrationError(
-                    f"unexpected logical rollout change: {relative}:{line_number}"
-                )
-
-    current_analysis, _ = analyze_migratable_rollouts(
-        codex_home,
-        sqlite_home / db_name,
-        source_provider,
-        target_provider,
-        allow_paginated=history_descriptor["present"],
-    )
-    if (
-        current_analysis.replacements
-        or current_analysis.history_base_offsets_changed
-    ):
-        raise MigrationError(
-            "source-provider or stale history_base rollout metadata remains "
-            "after migration"
-        )
-    if session_meta_changed != backup_analysis.session_meta_values:
-        raise MigrationError(
-            "session_meta replacement count changed during verification"
-        )
-    if thread_settings_changed != backup_analysis.thread_settings_values:
-        raise MigrationError(
-            "thread_settings replacement count changed during verification"
-        )
-    if history_base_changed != backup_analysis.history_base_offsets_changed:
-        raise MigrationError(
-            "history_base replacement count changed during verification"
-        )
+        workers.for_each(verify_rollout, sorted(original_by_relative), status)
 
     config_backup = backup_dir / "config.toml"
     config_current = codex_home / "config.toml"
@@ -2614,6 +2742,7 @@ def verify_against_backup(
                 backup_dir,
                 source_provider,
                 target_provider,
+                rollout_migration=backup_rollout_migration,
             )
         )
         current_history_metadata = capture_file_metadata(history_path)
@@ -2645,6 +2774,7 @@ def verify_against_backup(
     )
 
 
+@progress.phase("Check recoverable state")
 def verify_recoverable_state(
     *,
     backup_dir: Path,
@@ -2685,11 +2815,13 @@ def verify_recoverable_state(
         raise MigrationError(
             "live rollout file set is not recoverable from this backup"
         )
-    for relative, backup_path in backup_paths.items():
-        original = backup_path.read_bytes()
-        migrated = backup_rollout_migration.migrated_bytes[relative]
+
+    def check_recoverable_rollout(item):
+        relative, backup_path = item
         live_path = live_paths[relative]
-        if live_path.read_bytes() not in (original, migrated):
+        if not files_equal(backup_path, live_path) and not matches_chunks(
+            live_path, backup_rollout_migration.files[relative].chunks(backup_path)
+        ):
             raise MigrationError(
                 f"live rollout is neither original nor migrated: {relative}"
             )
@@ -2698,6 +2830,14 @@ def verify_recoverable_state(
             raise MigrationError(
                 f"live rollout metadata is not recoverable: {relative}"
             )
+        workers.advance(backup_path.stat().st_size, files=1)
+
+    with progress.phase(
+        "Check recoverable rollouts",
+        total_files=len(backup_paths),
+        total_bytes=sum(path.stat().st_size for path in backup_paths.values()),
+    ) as status:
+        workers.for_each(check_recoverable_rollout, backup_paths.items(), status)
 
     config_descriptor = manifest["artifacts"]["config"]
     config_backup = backup_dir / "config.toml"
@@ -2719,14 +2859,9 @@ def verify_recoverable_state(
             )
         current_config = config_current.read_bytes()
         if current_config not in (original_config, migrated_config):
-            raise MigrationError(
-                "live config.toml is neither original nor migrated"
-            )
+            raise MigrationError("live config.toml is neither original nor migrated")
         expected_metadata = validate_recorded_metadata(
-            {
-                key: config_descriptor[key]
-                for key in ("mode", "uid", "gid", "mtime_ns")
-            },
+            {key: config_descriptor[key] for key in ("mode", "uid", "gid", "mtime_ns")},
             "config.toml",
         )
         current_metadata = capture_file_metadata(config_current)
@@ -2749,9 +2884,7 @@ def verify_recoverable_state(
     current_database_metadata = capture_file_metadata(database_path)
     for key in ("uid", "gid"):
         if current_database_metadata[key] != expected_database_metadata[key]:
-            raise MigrationError(
-                f"live SQLite {key} is neither original nor migrated"
-            )
+            raise MigrationError(f"live SQLite {key} is neither original nor migrated")
     expected_mode = expected_database_metadata["mode"]
     known_modes = {expected_mode, expected_mode & ~(stat.S_ISUID | stat.S_ISGID)}
     if current_database_metadata["mode"] not in known_modes:
@@ -2846,7 +2979,8 @@ def restore_file_from_backup(source: Path, destination: Path) -> None:
     temporary = Path(temporary_name)
     try:
         with os.fdopen(fd, "wb") as stream:
-            stream.write(source.read_bytes())
+            for chunk in file_chunks(source):
+                stream.write(chunk)
             stream.flush()
             os.fsync(stream.fileno())
         set_file_owner(temporary, source_metadata.st_uid, source_metadata.st_gid)
@@ -2887,9 +3021,7 @@ def restore_database_from_backup(source: Path, destination: Path) -> None:
 
     normalize_database_backup_settings(destination, source_settings)
     if not destination_existed:
-        set_file_owner(
-            destination, source_metadata.st_uid, source_metadata.st_gid
-        )
+        set_file_owner(destination, source_metadata.st_uid, source_metadata.st_gid)
     os.chmod(destination, stat.S_IMODE(source_metadata.st_mode))
     os.utime(
         destination,
@@ -2899,6 +3031,7 @@ def restore_database_from_backup(source: Path, destination: Path) -> None:
         os.fsync(stream.fileno())
 
 
+@progress.phase("Verify restored state")
 def verify_restored_state(
     *,
     backup_dir: Path,
@@ -2919,15 +3052,14 @@ def verify_restored_state(
     if backup_paths.keys() != restored_paths.keys():
         raise MigrationError("rollout file set differs after restoration")
 
-    for relative, source in backup_paths.items():
+    def check_restored_rollout(item):
+        relative, source = item
         destination = restored_paths[relative]
-        if source.read_bytes() != destination.read_bytes():
+        if not files_equal(source, destination):
             raise MigrationError(f"restored rollout differs: {relative}")
         source_stat = source.stat()
         destination_stat = destination.stat()
-        if stat.S_IMODE(source_stat.st_mode) != stat.S_IMODE(
-            destination_stat.st_mode
-        ):
+        if stat.S_IMODE(source_stat.st_mode) != stat.S_IMODE(destination_stat.st_mode):
             raise MigrationError(f"restored rollout mode differs: {relative}")
         if (source_stat.st_uid, source_stat.st_gid) != (
             destination_stat.st_uid,
@@ -2936,6 +3068,14 @@ def verify_restored_state(
             raise MigrationError(f"restored rollout ownership differs: {relative}")
         if source_stat.st_mtime_ns != destination_stat.st_mtime_ns:
             raise MigrationError(f"restored rollout mtime differs: {relative}")
+        workers.advance(source.stat().st_size, files=1)
+
+    with progress.phase(
+        "Verify restored rollouts",
+        total_files=len(backup_paths),
+        total_bytes=sum(path.stat().st_size for path in backup_paths.values()),
+    ) as status:
+        workers.for_each(check_restored_rollout, backup_paths.items(), status)
 
     config_backup = backup_dir / "config.toml"
     config_current = codex_home / "config.toml"
@@ -2995,9 +3135,7 @@ def verify_restored_state(
             source_provider,
         )
         if changed_offsets:
-            raise MigrationError(
-                "thread-history offsets differ after restoration"
-            )
+            raise MigrationError("thread-history offsets differ after restoration")
         backup_history_stat = (backup_dir / HISTORY_DB_NAME).stat()
         restored_history_stat = history_path.stat()
         if stat.S_IMODE(backup_history_stat.st_mode) != stat.S_IMODE(
@@ -3030,6 +3168,7 @@ def verify_restored_state(
     )
 
 
+@progress.phase("Restore original state")
 def restore_original_state(
     *,
     backup_dir: Path,
@@ -3124,8 +3263,7 @@ def restore_original_state(
             }
             history_is_original = (
                 changed_offsets == 0
-                and capture_file_metadata(history_path)
-                == expected_history_metadata
+                and capture_file_metadata(history_path) == expected_history_metadata
             )
         except (MigrationError, sqlite3.Error):
             history_is_original = False
@@ -3168,9 +3306,7 @@ def restore_from_backup(
     manifest = load_backup_manifest(backup_dir)
     status = manifest.get("status")
     if status not in {"complete", "prepared", "restoring"}:
-        raise MigrationError(
-            "backup manifest is not in a restorable state"
-        )
+        raise MigrationError("backup manifest is not in a restorable state")
     codex_home = (codex_home or Path(manifest["codex_home"])).resolve()
     sqlite_home = (sqlite_home or Path(manifest["sqlite_home"])).resolve()
     if not codex_home.is_dir() or not sqlite_home.is_dir():
@@ -3208,9 +3344,7 @@ def restore_from_backup(
         )
 
     manifest["status"] = "restoring"
-    manifest["restoration_started_at"] = dt.datetime.now(
-        dt.timezone.utc
-    ).isoformat()
+    manifest["restoration_started_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
     try:
         write_json_atomic(backup_dir / MANIFEST_NAME, manifest)
     except (OSError, ValueError) as exc:
@@ -3270,6 +3404,16 @@ def apply_migration(
     ensure_supported_storage(codex_home, sqlite_home)
     db_path = sqlite_home / STATE_DB_NAME
     history_db_path = sqlite_home / HISTORY_DB_NAME
+    config_path = codex_home / "config.toml"
+    config_before = config_path.read_bytes() if config_path.is_file() else None
+    config_after = None
+    if migrate_config:
+        if config_before is None:
+            raise MigrationError("config.toml is missing")
+        config_after = plan_config_migration(
+            codex_home, config_before, source_provider, target_provider
+        )
+
     require_writable_database(db_path)
     rollout_analysis, rollout_migration = analyze_migratable_rollouts(
         codex_home,
@@ -3285,22 +3429,13 @@ def apply_migration(
         codex_home,
         source_provider,
         target_provider,
+        rollout_migration=rollout_migration,
     )
     if history_database_analysis.present:
         require_writable_database(
             history_db_path,
             label="thread-history database",
         )
-    config_path = codex_home / "config.toml"
-    config_before = config_path.read_bytes() if config_path.is_file() else None
-    config_after = None
-    if migrate_config:
-        if config_before is None:
-            raise MigrationError("config.toml is missing")
-        config_after = transform_config(
-            config_before, source_provider, target_provider
-        )
-        validate_config_profiles(codex_home, config_before, config_after)
 
     manifest = create_backup(
         codex_home=codex_home,
@@ -3313,24 +3448,38 @@ def apply_migration(
         rollout_analysis=rollout_analysis,
         database_analysis=database_analysis,
         history_database_analysis=history_database_analysis,
-        migrate_config=migrate_config,
+        migrate_config=config_after is not None,
     )
 
-    current_analysis, current_rollout_migration = analyze_migratable_rollouts(
-        codex_home,
-        db_path,
-        source_provider,
-        target_provider,
-        allow_paginated=history_database_analysis.present,
-    )
-    if (
-        current_analysis.file_hashes != rollout_analysis.file_hashes
-        or current_analysis.file_metadata != rollout_analysis.file_metadata
-        or current_rollout_migration != rollout_migration
-    ):
-        raise MigrationError(
-            "rollout state changed after backup; no migration was applied"
-        )
+    with progress.phase(
+        "Recheck source after backup",
+        total_files=len(rollout_migration.files),
+        total_bytes=sum(f.size for f in rollout_migration.files.values()),
+    ) as status:
+        current_paths = {
+            relative_rollout_path(codex_home, path): path
+            for path in rollout_paths(codex_home)
+        }
+        if current_paths.keys() != rollout_migration.files.keys():
+            raise MigrationError(
+                "rollout state changed after backup; no migration was applied"
+            )
+
+        def recheck_rollout(item):
+            relative, path = item
+            if (
+                sha256_file(path) != rollout_analysis.file_hashes[relative]
+                or capture_file_metadata(path)
+                != rollout_analysis.file_metadata[relative]
+            ):
+                raise MigrationError(
+                    "rollout state changed after backup; no migration was applied"
+                )
+            workers.advance(rollout_migration.files[relative].size, files=1)
+
+        workers.for_each(recheck_rollout, current_paths.items(), status)
+
+    current_rollout_migration = rollout_migration
     if config_before is None:
         if config_path.exists() or config_path.is_symlink():
             raise MigrationError(
@@ -3370,6 +3519,7 @@ def apply_migration(
         codex_home,
         source_provider,
         target_provider,
+        rollout_migration=current_rollout_migration,
     )
     if (
         current_history_analysis != history_database_analysis
@@ -3386,6 +3536,13 @@ def apply_migration(
             backup_dir,
             source_provider,
             source_provider,
+            rollout_migration=dataclasses.replace(
+                rollout_migration,
+                files={
+                    name: dataclasses.replace(file, edits=())
+                    for name, file in rollout_migration.files.items()
+                },
+            ),
         )
         if capture_file_metadata(history_db_path) != {
             key: manifest["artifacts"]["history_database"][key]
@@ -3405,24 +3562,21 @@ def apply_migration(
     # would leave the cross-file migration in an unknown partial state.
     try:
         changed_files = 0
-        changed_records = 0
-        for path in rollout_paths(codex_home):
-            original = path.read_bytes()
-            relative = relative_rollout_path(codex_home, path)
-            updated = rollout_migration.migrated_bytes[relative]
-            _, replacements = replace_provider_bytes(
-                original, source_provider, target_provider
-            )
-            if updated != original:
-                atomic_write(path, updated, preserve_mtime=True)
-                changed_files += 1
-            changed_records += replacements
+        with progress.phase(
+            "Write migrated rollouts",
+            total_files=len(rollout_migration.files),
+            total_bytes=sum(f.size for f in rollout_migration.files.values()),
+        ) as status:
+            for relative, file in rollout_migration.files.items():
+                path = codex_home / relative
+                if file.edits:
+                    atomic_write(path, file.chunks(path), preserve_mtime=True)
+                    changed_files += 1
+                elif sha256_file(path) != file.digest:
+                    raise MigrationError(f"rollout changed since preflight: {path}")
+                status.advance(file.size, files=1)
         if changed_files != rollout_analysis.files_requiring_changes:
             raise MigrationError("changed rollout file count does not match preflight")
-        if changed_records != rollout_analysis.replacements:
-            raise MigrationError(
-                "changed rollout record count does not match preflight"
-            )
 
         connection = sqlite3.connect(db_path)
         try:
@@ -3490,7 +3644,7 @@ def apply_migration(
         except BaseException as rollback_error:
             raise MigrationError(
                 "migration failed and automatic rollback also failed; "
-                f"migration error: {migration_error}; rollback error: {rollback_error}"
+                f"migration error: {progress.exception_message(migration_error)}; rollback error: {progress.exception_message(rollback_error)}"
             ) from rollback_error
         manifest["status"] = "rolled_back"
         manifest["rolled_back_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
@@ -3501,7 +3655,7 @@ def apply_migration(
             raise MigrationError(
                 "migration failed and automatic rollback was verified, but the "
                 "backup manifest could not be updated; "
-                f"migration error: {migration_error}"
+                f"migration error: {progress.exception_message(migration_error)}"
             ) from manifest_error
         raise
 
@@ -3513,10 +3667,16 @@ def default_codex_home() -> Path:
 
 def configured_sqlite_path(value: Any, config_path: Path) -> Path:
     if not isinstance(value, str) or not value.strip() or "\x00" in value:
-        raise MigrationError(f"invalid sqlite_home in {config_path}; pass --sqlite-home explicitly")
+        raise MigrationError(
+            f"invalid sqlite_home in {config_path}; pass --sqlite-home explicitly"
+        )
     path = Path(value)
     # Codex expands ~ and ~/..., but not shell-style ~other-user paths.
-    if value == "~" or value.startswith("~/") or (os.name == "nt" and value.startswith("~\\")):
+    if (
+        value == "~"
+        or value.startswith("~/")
+        or (os.name == "nt" and value.startswith("~\\"))
+    ):
         path = path.expanduser()
     return (path if path.is_absolute() else config_path.parent / path).resolve()
 
@@ -3555,9 +3715,10 @@ def resolve_sqlite_home(
         system_root = Path("/etc/codex")
     external_paths = [codex_home / "managed_config.toml"]
     if system_root is not None:
-        external_paths.extend(system_root / name for name in (
-            "config.toml", "requirements.toml", "managed_config.toml"
-        ))
+        external_paths.extend(
+            system_root / name
+            for name in ("config.toml", "requirements.toml", "managed_config.toml")
+        )
     for path in external_paths:
         if "sqlite_home" in read_config_file(path):
             raise MigrationError(
@@ -3626,7 +3787,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--migrate-config",
         action="store_true",
-        help="convert a compatible custom provider to openai_base_url",
+        help="convert a compatible custom provider to openai_base_url; skip with a warning if already openai",
     )
     parser.add_argument(
         "--apply",
@@ -3648,6 +3809,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="emit machine-readable JSON",
     )
+    progress.add_arguments(parser)
     return parser
 
 
@@ -3661,6 +3823,20 @@ def emit(value: dict[str, Any], as_json: bool) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    try:
+        with (
+            progress.reporting(args),
+            progress.phase("Apply migration" if args.apply else "Dry run") as status,
+        ):
+            result = run(args)
+            status.outcome = "failed" if result else "completed"
+            return result
+    except (MigrationError, OSError, ValueError, sqlite3.Error, MemoryError) as exc:
+        progress.error(progress.exception_message(exc))
+        return 1
+
+
+def run(args: argparse.Namespace) -> int:
     try:
         codex_home = args.codex_home.resolve()
         sqlite_home, sqlite_home_source = resolve_sqlite_home(
@@ -3698,7 +3874,18 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 0
 
-        rollout, _ = analyze_migratable_rollouts(
+        config_status = "not requested"
+        if args.migrate_config:
+            config_path = codex_home / "config.toml"
+            original = config_path.read_bytes()
+            transformed = plan_config_migration(
+                codex_home, original, args.from_provider, args.to_provider
+            )
+            config_status = (
+                "eligible" if transformed is not None else "skipped; already openai"
+            )
+
+        rollout, rollout_plan = analyze_migratable_rollouts(
             codex_home,
             db_path,
             args.from_provider,
@@ -3706,20 +3893,14 @@ def main(argv: list[str] | None = None) -> int:
             allow_paginated=history_db_path.is_file(),
         )
         database = analyze_database(db_path, args.from_provider)
-        history_database = analyze_history_database(
+        history_database, _ = inspect_history_database(
             history_db_path,
             db_path,
             codex_home,
             args.from_provider,
             args.to_provider,
+            rollout_migration=rollout_plan,
         )
-        config_status = "not requested"
-        if args.migrate_config:
-            config_path = codex_home / "config.toml"
-            original = config_path.read_bytes()
-            transformed = transform_config(original, args.from_provider, args.to_provider)
-            validate_config_profiles(codex_home, original, transformed)
-            config_status = "eligible"
         emit(
             {
                 "result": "dry run; no Codex records changed",
@@ -3746,13 +3927,14 @@ def main(argv: list[str] | None = None) -> int:
             args.json,
         )
         return 0
-    except (MigrationError, OSError, ValueError, sqlite3.Error) as exc:
-        print(f"error: {exc}", file=sys.stderr)
+    except KeyboardInterrupt:
+        progress.error("interrupted; active file workers have stopped")
+        return 130
+    except (MigrationError, OSError, ValueError, sqlite3.Error, MemoryError) as exc:
+        progress.error(progress.exception_message(exc))
         if args.apply and args.backup_dir and args.backup_dir.exists():
-            print(
-                "backup/recovery data may be available at: "
-                f"{args.backup_dir.resolve()}",
-                file=sys.stderr,
+            progress.error(
+                f"backup/recovery data may be available at: {args.backup_dir.resolve()}"
             )
         return 1
 

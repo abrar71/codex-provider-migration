@@ -11,10 +11,122 @@ automatically performs an exhaustive backup-versus-result verification before
 reporting success. If any write or final verification fails, it restores and
 verifies the original state from the backup before returning the error.
 
+## Version 1.5: concurrent file processing
+
+The commands in this README use `--workers 0` to run with **all available
+logical CPUs**. CPU affinity and Linux cgroup CPU quotas restrict the available
+count. This applies to dry runs, apply, verification, and restoration, including
+the Docker commands.
+
+If you omit `--workers`, the CLI uses `auto`: **90% of available logical CPUs,
+rounded down, with a minimum of one worker**. For example, 4 available CPU
+threads select 3 workers; 16 select 14. `--workers 1` runs sequentially; other
+positive values select that many workers. These options set the worker count;
+they do not throttle CPU usage to a fixed percentage.
+
+Scan workers run in separate processes so JSON parsing can use multiple cores.
+Each worker streams one file at a time. Paginated boundary checks also run in
+processes; backup copies, hash checks, and byte comparisons use threads. The
+coordinator combines file results in a stable order and resolves cross-file
+history references after validation. SQLite operations, live file replacements,
+and restoration writes stay sequential. A failed or interrupted phase stops
+and drains its workers before recovery begins.
+
+```bash
+# Use all available CPU threads, with progress enabled.
+python3 migrate.py --from-provider proxy --to-provider openai --workers 0
+
+# Other options: automatic sizing, a fixed count, or sequential processing.
+python3 migrate.py --from-provider proxy --to-provider openai --workers auto
+python3 migrate.py --from-provider proxy --to-provider openai --workers 4
+python3 migrate.py --from-provider proxy --to-provider openai --workers 1
+```
+
+The scheduler keeps at most one task per worker in flight. More workers increase
+memory use because each process parses its own records and maintains its Python
+runtime. A busy or slow disk can also limit the benefit. Use `--workers 1` for
+tight memory limits; the memory regression test exercises that mode under a
+256 MiB address-space limit. All three commands and Docker subcommands accept
+`--workers auto|N`.
+
+## Streaming and progress
+
+Version 1.4 fixes the archive-wide memory loading that could exhaust RAM before
+backup creation. It scans JSONL one record at a time and keeps a sparse plan of
+the exact bytes to replace. Apply, verification, and restoration stream file
+contents; SQLite comparisons stream sorted rows instead of loading whole tables.
+Preflight reuses its validated plan, and the check after backup compares hashes
+and metadata without parsing the archive again. Unchanged rollouts are not rewritten.
+
+Memory depends on the worker count, largest JSONL record or SQLite row, changed
+fields, referenced history boundaries, and SQLite caches. It no longer includes
+complete original and transformed copies of the archive. The default maximum
+record size is 64 MiB;
+`--max-record-mib N` changes that limit for unusually large imported records.
+Raising it also raises the possible memory use. SQLite may use temporary disk
+space to sort tables during verification.
+
+Every command now reports progress on **stderr**, including dry runs, apply,
+verification, and restoration. Reports include the current phase, elapsed time,
+file and byte counts where available, MiB/s, an estimate of time remaining for
+that phase, active/configured workers, and estimated peak memory including scan
+processes. A heartbeat continues during database checks and other operations
+whose total work is not known. Nothing is sent to
+a telemetry service, and progress does not include conversation text.
+
+```bash
+# Human-readable progress is enabled by default.
+python3 migrate.py --from-provider proxy --to-provider openai --workers 0
+
+# Final result on stdout; progress and operational errors as JSON Lines on stderr.
+python3 migrate.py --from-provider proxy --to-provider openai \
+  --workers 0 --json --progress json >result.json 2>progress.jsonl
+
+# Less frequent updates, or no progress output.
+python3 migrate.py --from-provider proxy --to-provider openai --workers 0 --progress-interval 5
+python3 migrate.py --from-provider proxy --to-provider openai --workers 0 --progress off
+```
+
+`--workers auto|N`, `--progress {auto,text,json,off}`, `--progress-interval SECONDS`, and
+`--max-record-mib N` also work with `verify.py`, `restore.py`, and the Docker
+subcommands. `--progress auto` selects readable text for both terminals and logs.
+The JSON progress fields are `event`, `phase`, `elapsed_seconds`,
+`phase_elapsed_seconds`, `bytes_processed`, `bytes_total`, `files_processed`,
+`files_total`, `bytes_per_second`, `eta_seconds`, `workers`, `active_workers`,
+`worker_peak_memory_bytes`, and `peak_memory_bytes`.
+Unknown totals, estimates, or unsupported memory measurements are `null`.
+Warnings have `event: "warning"` and a `message`. Operational errors have
+`event: "error"` and a `message`; invalid CLI arguments
+are handled by argparse before progress starts. Rates and totals describe each
+phase, so rescanning or verifying a file counts as separate work.
+
+Memory reporting sums the coordinator's peak RSS and the highest reported RSS
+of each scan process. It is a conservative estimate: processes can peak at
+different times, and shared pages can be counted more than once. It is not a
+hard memory limit. Worker memory is sampled as chunks and tasks complete.
+`active_workers` counts tasks in flight; database and sequential write phases
+report zero. Very short phases may finish before a heartbeat update.
+
+If your configuration already uses `openai`, you can omit `--migrate-config`.
+With that flag, an explicit `model_provider = "openai"` or an omitted selector
+produces a warning and skips config changes. Session migration continues, and
+the config's bytes and modification time are preserved. Dry-run JSON reports
+`config_migration: "skipped; already openai"`. The backup manifest records that
+no config migration occurred, so verification and restore check the original
+config exactly. Warnings remain visible with `--progress off`.
+
+A selector for an unrelated provider, an invalid config, or incompatible settings
+in a provider that needs conversion still produce an error. Config conversion
+is checked before scanning the archive, so these errors fail early. Stop Codex
+before a consistent dry run and always before apply. A file changing during
+either scan is reported as an error.
+
 > [!CAUTION]
 > Codex state can contain prompts, responses, repository paths, and account
 > metadata. Treat both the live state and migration backup as private data. Do
 > not commit, upload, or attach either one to a public issue.
+
+Measured results for a 3.15 GiB archive are in [BENCHMARK.md](BENCHMARK.md).
 
 ## Compatibility and supported scope
 
@@ -172,6 +284,8 @@ closing the session that helped prepare it.
 
 ## Docker
 
+### Build Image
+
 Build the local image from the repository checkout:
 
 ```bash
@@ -181,10 +295,12 @@ docker build -t codex-provider-migration:local .
 
 The image has three subcommands: `migrate`, `verify`, and `restore`. The
 container makes no network requests at runtime, and the commands below disable
-container networking explicitly. Its build context is restricted to the four
-Python scripts and `Dockerfile`, so local Codex state and backups cannot be
+container networking explicitly. Its build context is restricted to the seven
+Python modules and `Dockerfile`, so local Codex state and backups cannot be
 copied into the image accidentally. Run `make docker-check` to build the image
 and smoke-test all three subcommands without network access.
+
+### Dry Run
 
 Set the host state path, then perform a dry run with the state mounted at
 `/codex`:
@@ -198,6 +314,7 @@ docker run --rm \
   --user "$(id -u):$(id -g)" \
   --mount "type=bind,src=${codex_state_dir},dst=/codex" \
   "$image" migrate \
+  --workers 0 \
   --codex-home /codex \
   --sqlite-home /codex \
   --from-provider proxy \
@@ -209,6 +326,8 @@ The state mount is intentionally writable because SQLite may create WAL
 coordination sidecars during otherwise read-only validation. On systems where
 Docker does not support host numeric user IDs, omit `--user`; be aware that a
 root container can leave the new backup owned by root.
+
+### Run Migration
 
 To apply, mount a backup *parent* directory and pass a child path that does not
 exist yet. Stop every Codex process first:
@@ -225,6 +344,7 @@ docker run --rm \
   --mount "type=bind,src=${codex_state_dir},dst=/codex" \
   --mount "type=bind,src=${backup_parent},dst=/backups" \
   "$image" migrate \
+  --workers 0 \
   --codex-home /codex \
   --sqlite-home /codex \
   --from-provider proxy \
@@ -240,6 +360,8 @@ every Docker runtime and does not replace the requirement to stop Codex. If the
 SQLite state is separate, add another bind mount at `/sqlite` and use
 `--sqlite-home /sqlite`.
 
+### Verify Migration
+
 Re-run verification with the same state and backup mounts:
 
 ```bash
@@ -249,10 +371,13 @@ docker run --rm \
   --mount "type=bind,src=${codex_state_dir},dst=/codex" \
   --mount "type=bind,src=${backup_parent},dst=/backups,readonly" \
   "$image" verify \
+  --workers 0 \
   --backup-dir "/backups/${backup_name}" \
   --codex-home /codex \
   --sqlite-home /codex
 ```
+
+### Restore Backup
 
 To undo a completed migration, stop Codex and use a writable backup mount so
 the manifest can record recovery progress:
@@ -265,6 +390,7 @@ docker run --rm \
   --mount "type=bind,src=${codex_state_dir},dst=/codex" \
   --mount "type=bind,src=${backup_parent},dst=/backups" \
   "$image" restore \
+  --workers 0 \
   --backup-dir "/backups/${backup_name}" \
   --codex-home /codex \
   --sqlite-home /codex \
@@ -280,6 +406,7 @@ git clone https://github.com/abrar71/codex-provider-migration.git
 cd codex-provider-migration
 
 python3 migrate.py \
+  --workers 0 \
   --from-provider proxy \
   --to-provider openai \
   --migrate-config
@@ -307,6 +434,7 @@ location outside the Codex state directory and outside the repository checkout:
 migration_backup_dir="${HOME}/codex-provider-backup-$(date -u +%Y%m%dT%H%M%SZ)"
 
 python3 migrate.py \
+  --workers 0 \
   --from-provider proxy \
   --to-provider openai \
   --migrate-config \
@@ -334,7 +462,7 @@ Keep this backup until the migrated chats have been inspected successfully.
 Before restarting Codex, verification can be repeated independently:
 
 ```bash
-python3 verify.py --backup-dir "$migration_backup_dir"
+python3 verify.py --workers 0 --backup-dir "$migration_backup_dir"
 ```
 
 The verifier compares every rollout byte-for-byte against the exact expected
@@ -374,6 +502,7 @@ If you want to undo a completed migration, keep Codex stopped and run:
 
 ```bash
 python3 restore.py \
+  --workers 0 \
   --backup-dir "$migration_backup_dir" \
   --confirm-codex-stopped
 ```
@@ -439,6 +568,20 @@ tampering, newer live activity, config presence changes, WAL sidecars,
 automatic rollback, and resuming an interrupted restore. Test data uses
 reserved example domains and temporary directories; it does not require real
 Codex state.
+
+Streaming regressions also check source changes during a rewrite, exact SQLite
+row comparisons with duplicates and collations, record-size limits, and progress
+output. On Linux, a subprocess exercises dry-run, apply, verify, and restore on
+a generated archive larger than its 256 MiB address-space limit with
+`--workers 1`. A second test runs those operations with three workers on an
+archive larger than 512 MiB, with a 512 MiB limit per process and a check that
+the reported combined peak stays below 512 MiB. That test sets
+`MALLOC_ARENA_MAX=2` to bound glibc's virtual memory reservations for threads.
+Both tests remove their data.
+
+Concurrency tests check identical plans and restored bytes, chained history
+references, duplicate IDs across workers, inherited record-size limits, bounded
+task submission, worker failures, Ctrl+C, rollback, and aggregated progress.
 
 ## Project status
 

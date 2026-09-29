@@ -9,7 +9,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /opt/codex-provider-migration
 
-COPY migrate.py restore.py verify.py docker_entrypoint.py ./
+COPY migrate.py migration_io.py migration_workers.py progress.py restore.py verify.py docker_entrypoint.py ./
 
 ENTRYPOINT ["python3", "/opt/codex-provider-migration/docker_entrypoint.py"]
 CMD ["migrate", "--help"]

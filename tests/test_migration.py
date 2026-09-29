@@ -876,7 +876,11 @@ class ProviderMigrationTests(unittest.TestCase):
             child_rollout,
         )
         planned_child = json.loads(
-            plan.migrated_bytes[child_relative].splitlines()[0]
+            b"".join(
+                plan.files[child_relative].chunks(
+                    self.fixture.codex_home / child_relative
+                )
+            ).splitlines()[0]
         )
         self.assertEqual(
             planned_child["payload"]["history_base"]["end_byte_offset"],
@@ -1074,7 +1078,11 @@ class ProviderMigrationTests(unittest.TestCase):
             self.fixture.codex_home,
             grandchild_rollout,
         )
-        migrated = json.loads(plan.migrated_bytes[relative].splitlines()[0])
+        migrated = json.loads(
+            b"".join(
+                plan.files[relative].chunks(self.fixture.codex_home / relative)
+            ).splitlines()[0]
+        )
         self.assertEqual(
             migrated["payload"]["history_base"]["end_byte_offset"],
             child_boundary + 2,

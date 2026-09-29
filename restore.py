@@ -7,12 +7,10 @@ import argparse
 import dataclasses
 import json
 import sqlite3
-import sys
 from pathlib import Path
 
-from migrate import MigrationError
-from migrate import TOOL_VERSION
-from migrate import restore_from_backup
+import progress
+from migrate import TOOL_VERSION, MigrationError, restore_from_backup
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -44,11 +42,23 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="emit machine-readable JSON",
     )
+    progress.add_arguments(parser)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    try:
+        with progress.reporting(args), progress.phase("Restore backup") as status:
+            result = run(args)
+            status.outcome = "failed" if result else "completed"
+            return result
+    except (MigrationError, OSError, ValueError, sqlite3.Error, MemoryError) as exc:
+        progress.error(progress.exception_message(exc))
+        return 1
+
+
+def run(args: argparse.Namespace) -> int:
     try:
         report = restore_from_backup(
             backup_dir=args.backup_dir.resolve(),
@@ -56,8 +66,11 @@ def main(argv: list[str] | None = None) -> int:
             sqlite_home=args.sqlite_home.resolve() if args.sqlite_home else None,
             confirm_stopped=args.confirm_codex_stopped,
         )
-    except (MigrationError, OSError, ValueError, sqlite3.Error) as exc:
-        print(f"error: {exc}", file=sys.stderr)
+    except KeyboardInterrupt:
+        progress.error("interrupted; active file workers have stopped")
+        return 130
+    except (MigrationError, OSError, ValueError, sqlite3.Error, MemoryError) as exc:
+        progress.error(progress.exception_message(exc))
         return 1
 
     values = {

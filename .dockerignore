@@ -4,3 +4,6 @@
 !migrate.py
 !restore.py
 !verify.py
+!migration_io.py
+!migration_workers.py
+!progress.py
