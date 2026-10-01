@@ -726,7 +726,7 @@ def rollout_offset_translation(original: bytes, migrated: bytes) -> dict[int, in
     return offsets
 
 
-# Durable envelopes and events in Codex 0.149--0.157. Unknown envelopes do
+# Durable envelopes and events checked through Codex 0.159.3. Unknown envelopes do
 # not advance a recovered projection. A later recognized explicit ordinal
 # can establish a new checkpoint without interpreting unknown payload data.
 ROLLOUT_TYPES = {
@@ -743,7 +743,7 @@ ROLLOUT_TYPES = {
     "realtime_item",
     "event_msg",
 }
-# EventMsg tags, including historical task_* names, from upstream 18344a972d.
+# EventMsg tags, including historical task_* names, checked at rust-v0.159.3.
 # Count recognized transient events too: older/imported files can contain them.
 KNOWN_EVENT_TYPES = frozenset(
     """

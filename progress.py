@@ -116,7 +116,8 @@ class Reporter:
                 line = " | ".join(parts)
             try:
                 print(line, file=sys.stderr, flush=True)
-            except OSError:
+            except (OSError, ValueError):
+                # Closed Python streams raise ValueError.
                 # Telemetry must never interrupt a migration or its rollback.
                 self.mode = "off"
 

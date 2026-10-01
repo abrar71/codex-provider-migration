@@ -174,6 +174,88 @@ class StreamingTests(unittest.TestCase):
         self.assertTrue(any(e["event"] == "progress" for e in events))
         self.assertEqual(events[-1]["event"], "completed")
 
+    def test_closed_stderr_does_not_interrupt_apply_verify_restore(self):
+        for mode in ("text", "json"):
+            with self.subTest(mode=mode):
+                fixture = MigrationFixture(self.fixture.root / mode)
+                original = fixture.proxy_rollout.read_bytes()
+                stderr = io.StringIO()
+                stderr.close()
+                args = SimpleNamespace(
+                    progress=mode, progress_interval=3600, max_record_mib=64, workers=1
+                )
+                with (
+                    redirect_stderr(stderr),
+                    progress.reporting(args) as reporter,
+                    mock.patch.object(
+                        migrate, "find_processes_with_open_state", return_value=[]
+                    ),
+                ):
+                    report = migrate.apply_migration(
+                        codex_home=fixture.codex_home,
+                        sqlite_home=fixture.sqlite_home,
+                        backup_dir=fixture.backup_dir,
+                        source_provider="proxy",
+                        target_provider="openai",
+                        migrate_config=True,
+                        confirm_stopped=True,
+                    )
+                    self.assertEqual(reporter.mode, "off")
+                    self.assertEqual(
+                        migrate.verify_against_backup(backup_dir=fixture.backup_dir),
+                        report,
+                    )
+                    migrate.restore_from_backup(
+                        backup_dir=fixture.backup_dir, confirm_stopped=True
+                    )
+                self.assertEqual(fixture.proxy_rollout.read_bytes(), original)
+                self.assertEqual(
+                    migrate.load_backup_manifest(fixture.backup_dir)["status"],
+                    "restored",
+                )
+
+    def test_stderr_closing_after_writes_does_not_prevent_rollback(self):
+        fixture = self.fixture
+        original = fixture.proxy_rollout.read_bytes()
+        stderr = io.StringIO()
+        self.addCleanup(stderr.close)
+        failure = migrate.MigrationError("injected verification failure")
+
+        def fail_verification(**_kwargs):
+            self.assertNotEqual(fixture.proxy_rollout.read_bytes(), original)
+            stderr.close()
+            raise failure
+
+        args = SimpleNamespace(
+            progress="text", progress_interval=3600, max_record_mib=64, workers=1
+        )
+        with (
+            redirect_stderr(stderr),
+            progress.reporting(args) as reporter,
+            mock.patch.object(
+                migrate, "find_processes_with_open_state", return_value=[]
+            ),
+            mock.patch.object(
+                migrate, "verify_against_backup", side_effect=fail_verification
+            ),
+        ):
+            with self.assertRaises(migrate.MigrationError) as raised:
+                migrate.apply_migration(
+                    codex_home=fixture.codex_home,
+                    sqlite_home=fixture.sqlite_home,
+                    backup_dir=fixture.backup_dir,
+                    source_provider="proxy",
+                    target_provider="openai",
+                    migrate_config=True,
+                    confirm_stopped=True,
+                )
+            self.assertIs(raised.exception, failure)
+            self.assertEqual(reporter.mode, "off")
+        self.assertEqual(fixture.proxy_rollout.read_bytes(), original)
+        manifest = migrate.load_backup_manifest(fixture.backup_dir)
+        self.assertEqual(manifest["status"], "rolled_back")
+        self.assertIn("rollback_report", manifest)
+
     @unittest.skipUnless(
         sys.platform.startswith("linux"), "Linux address-space limit regression"
     )
